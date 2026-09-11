@@ -87,7 +87,8 @@ enum class RefreshAnchor {
 
 enum class ExitReason {
     None,
-    RunUpdater,
+    // The updater exit reason was removed (PC-020): the Throne updater install
+    // path is disabled until a ProxyCore update channel exists.
     Restart,
     RestartWithTun,
     RestartWithDns,
