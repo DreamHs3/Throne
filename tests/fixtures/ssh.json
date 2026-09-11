@@ -1,0 +1,65 @@
+{
+  "protocol": "ssh",
+  "cases": [
+    {
+      "id": "ssh-link-basic",
+      "input_link": "ssh://example-user@core.example.com:2222?password=example-password&private_key=UEMtVEVTVC1QUklWQVRFLUtFWS1TWU5USEVUSUMtMDAwMQ&host_key=cGMtdGVzdC1ob3N0LWtleS0wMDAx-cGMtdGVzdC1ob3N0LWtleS0wMDAy&client_version=PC-Test_1.0#fixture-ssh-basic",
+      "parse_ok": true,
+      "expected": {
+        "name": "fixture-ssh-basic",
+        "server": "core.example.com",
+        "server_port": 2222,
+        "user": "example-user",
+        "password": "example-password",
+        "private_key": "PC-TEST-PRIVATE-KEY-SYNTHETIC-0001",
+        "host_key": ["pc-test-host-key-0001", "pc-test-host-key-0002"],
+        "client_version": "PC-Test_1.0"
+      },
+      "round_trip_link": true,
+      "round_trip_json": true,
+      "build_json_contains": {
+        "type": "ssh",
+        "server": "core.example.com",
+        "server_port": 2222,
+        "user": "example-user",
+        "client_version": "PC-Test_1.0"
+      }
+    },
+    {
+      "id": "ssh-link-minimal",
+      "input_link": "ssh://core2.example.com:22#fixture-ssh-minimal",
+      "parse_ok": true,
+      "expected": {
+        "name": "fixture-ssh-minimal",
+        "server": "core2.example.com",
+        "server_port": 22,
+        "user": "",
+        "password": "",
+        "private_key": "",
+        "host_key": []
+      },
+      "round_trip_link": true,
+      "round_trip_json": true
+    },
+    {
+      "id": "ssh-json-roundtrip",
+      "input_json": {
+        "type": "ssh",
+        "tag": "fixture-ssh-json",
+        "server": "192.0.2.10",
+        "server_port": 22022,
+        "user": "example-user",
+        "private_key": "PC-TEST-PRIVATE-KEY-SYNTHETIC-0002"
+      },
+      "parse_ok": true,
+      "expected": {
+        "name": "fixture-ssh-json",
+        "server": "192.0.2.10",
+        "server_port": 22022,
+        "user": "example-user",
+        "private_key": "PC-TEST-PRIVATE-KEY-SYNTHETIC-0002"
+      },
+      "round_trip_json": true
+    }
+  ]
+}

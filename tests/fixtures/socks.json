@@ -1,0 +1,84 @@
+{
+  "protocol": "socks",
+  "cases": [
+    {
+      "id": "socks5-link-auth",
+      "input_link": "socks5://example-user:example-password@socks.example.com:1080#fixture-socks5-basic",
+      "parse_ok": true,
+      "expected": {
+        "name": "fixture-socks5-basic",
+        "server": "socks.example.com",
+        "server_port": 1080,
+        "username": "example-user",
+        "password": "example-password",
+        "version": 5,
+        "uot": false
+      },
+      "round_trip_link": true,
+      "round_trip_json": true,
+      "build_json_contains": {
+        "type": "socks",
+        "server": "socks.example.com",
+        "server_port": 1080,
+        "username": "example-user",
+        "password": "example-password"
+      }
+    },
+    {
+      "id": "socks5-link-noauth",
+      "input_link": "socks5://192.0.2.30:10808#fixture-socks5-noauth",
+      "parse_ok": true,
+      "expected": {
+        "name": "fixture-socks5-noauth",
+        "server": "192.0.2.30",
+        "server_port": 10808,
+        "username": "",
+        "password": "",
+        "version": 5,
+        "uot": false
+      },
+      "round_trip_link": true,
+      "round_trip_json": true
+    },
+    {
+      "id": "socks5-link-default-port",
+      "input_link": "socks5://socks2.example.com#fixture-socks5-defaultport",
+      "parse_ok": true,
+      "expected": {
+        "name": "fixture-socks5-defaultport",
+        "server": "socks2.example.com",
+        "server_port": 1080,
+        "version": 5
+      },
+      "round_trip_link": true
+    },
+    {
+      "id": "socks5-link-uot",
+      "input_link": "socks5://socks3.example.com:1080?uot=1#fixture-socks5-uot",
+      "parse_ok": true,
+      "expected": {
+        "name": "fixture-socks5-uot",
+        "server": "socks3.example.com",
+        "server_port": 1080,
+        "version": 5,
+        "uot": true
+      },
+      "round_trip_link": true,
+      "round_trip_json": true
+    },
+    {
+      "id": "socks4-link-basic",
+      "input_link": "socks4://192.0.2.31:1080#fixture-socks4-basic",
+      "parse_ok": true,
+      "expected": {
+        "name": "fixture-socks4-basic",
+        "server": "192.0.2.31",
+        "server_port": 1080,
+        "version": 4
+      },
+      "round_trip_link": true,
+      "round_trip_json": false,
+      "known_defect": "socks4-version-string-roundtrip: ExportToJson()/Build() write \"version\": \"4\" (string) while ParseFromJson reads object[\"version\"].toInt() which returns 0 for a string JSON value — a JSON round-trip of a socks4 profile loses version=4. Characterization only; do not fix in PC-000/030."
+    }
+  ]
+}
