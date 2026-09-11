@@ -21,6 +21,8 @@
 #include "include/global/Configs.hpp"
 #include "include/global/Logger.hpp"
 
+#include "include/proxycore/storage/ThroneMigration.h"
+
 #include "include/ui/mainwindow_interface.h"
 #include "include/stats/traffic/TrafficStatsManager.hpp"
 #include "include/api/RPC.h"
@@ -204,7 +206,7 @@ namespace {
     }
 }
 
-#define LOCAL_SERVER_PREFIX "throne-"
+#define LOCAL_SERVER_PREFIX "proxycore-"
 
 int main(int argc, char* argv[]) {
     Logging::InstallQtMessageHandler();
@@ -264,7 +266,12 @@ int main(int argc, char* argv[]) {
 #ifdef NKR_CPP_USE_APPDATA
     useAppdata = true;
 #endif
-    QApplication::setApplicationName("Throne");
+    // Data-directory identity (PC-010). The visible application name moves to
+    // ProxyCore so QStandardPaths lands in a fresh, Throne-independent data
+    // directory. The executable file itself must stay Throne.exe /
+    // ThroneCore.exe: core/server/parentcheck verifies the parent executable
+    // basename, so renaming either breaks core startup.
+    QApplication::setApplicationName("ProxyCore");
     if(useAppdata) {
         if (!appdataDir.isEmpty()) {
             wd.setPath(appdataDir);
@@ -283,6 +290,25 @@ int main(int argc, char* argv[]) {
     const QString configDir = wd.absoluteFilePath("config");
     QDir::setCurrent(configDir);
     QDir("temp").removeRecursively();
+
+    // PC-010: `-migrate-from-throne [path]` imports a COPY of a Throne data
+    // directory into our own. The source is only read, never modified; the
+    // manifest written on success enables exact rollback.
+    if (arguments.contains("-migrate-from-throne")) {
+        QString throneSource = ProxyCore::Storage::DefaultThroneDataDir();
+        const int migrateIndex = arguments.indexOf("-migrate-from-throne");
+        if (migrateIndex >= 0 && arguments.size() > migrateIndex + 1 && !arguments.at(migrateIndex + 1).startsWith("-")) {
+            throneSource = arguments.at(migrateIndex + 1);
+        }
+        const auto migrated = ProxyCore::Storage::MigrateFromThrone(throneSource, configDir);
+        if (migrated.ok) {
+            LOG_INFO(QString("migrated %1 files (%2 bytes) from %3; manifest: %4")
+                         .arg(migrated.filesCopied).arg(migrated.bytesCopied)
+                         .arg(throneSource, migrated.manifestPath));
+        } else {
+            LOG_WARN(QString("migration from %1 not performed: %2").arg(throneSource, migrated.error));
+        }
+    }
 
     appStartEpoch = QDateTime::currentSecsSinceEpoch();
 

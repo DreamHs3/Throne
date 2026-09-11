@@ -91,6 +91,8 @@ set(PROJECT_SOURCES
         src/global/Logger.cpp
         include/global/PeriodicRunner.hpp
         src/global/PeriodicRunner.cpp
+        include/proxycore/storage/ThroneMigration.h
+        src/proxycore/storage/ThroneMigration.cpp
         src/global/HTTPRequestHelper.cpp
         src/global/DeviceDetailsHelper.cpp
         src/global/CountryHelper.cpp
@@ -637,3 +639,9 @@ target_link_libraries(Throne PRIVATE
 )
 
 qt_finalize_executable(Throne)
+
+# ProxyCore test harnesses (PC-010/PC-030); OFF keeps the upstream build identical.
+option(PROXYCORE_BUILD_TESTS "Build ProxyCore test harnesses" OFF)
+if (PROXYCORE_BUILD_TESTS)
+    add_subdirectory(tests/proxycore)
+endif ()

@@ -2,14 +2,16 @@ set(PLATFORM_SOURCES 3rdparty/WinCommander.cpp src/sys/windows/guihelper.cpp src
 set(PLATFORM_LIBRARIES wininet wsock32 ws2_32 user32 rasapi32 iphlpapi ntdll wbemuuid psapi shell32)
 
 include(cmake/windows/generate_product_version.cmake)
+# PC-010: visible product metadata is ProxyCore; the executable file keeps the
+# internal Throne.exe name (parentcheck contract), hence ORIGINAL_FILENAME.
 generate_product_version(
         QV2RAY_RC
         ICON "${CMAKE_SOURCE_DIR}/res/Throne.ico"
-        NAME "Throne"
-        BUNDLE "Throne"
-        COMPANY_NAME "Throne"
-        COMPANY_COPYRIGHT "Throne"
-        FILE_DESCRIPTION "Throne"
+        NAME "ProxyCore"
+        BUNDLE "ProxyCore"
+        COMPANY_NAME "ProxyCore"
+        COMPANY_COPYRIGHT "ProxyCore"
+        FILE_DESCRIPTION "ProxyCore"
         ORIGINAL_FILENAME "Throne.exe"
         VERSION_MAJOR ${NKR_VERSION_MAJOR}
         VERSION_MINOR ${NKR_VERSION_MINOR}

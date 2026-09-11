@@ -10,7 +10,11 @@
 // In QSettings NativeFormat the value name "Default" is a key's unnamed (Default) value, and '/' separates subkeys.
 
 static const QString kClasses = "HKEY_CURRENT_USER\\Software\\Classes";
-static const QString kProgId = "Throne.Config";
+// PC-010: ProxyCore registers its own scheme and ProgId so a simultaneously
+// installed Throne keeps its own throne:// / Throne.Config registrations
+// instead of both apps fighting over the same keys.
+static const QString kProgId = "ProxyCore.Config";
+static const QString kUrlScheme = "proxycore";
 
 static const QStringList kConfigExtensions = {".json", ".conf", ".yaml", ".yml", ".ini", ".txt"};
 
@@ -22,7 +26,7 @@ static QString openCommand() {
 static QStringList commandKeys() {
     const QString exeName = QFileInfo(QApplication::applicationFilePath()).fileName();
     return {
-        kClasses + "\\throne",
+        kClasses + "\\" + kUrlScheme,
         kClasses + "\\" + kProgId,
         kClasses + "\\Applications\\" + exeName,
     };
@@ -45,13 +49,13 @@ void UrlScheme_Apply() {
     const QString command = openCommand();
     const QString exe = QDir::toNativeSeparators(QApplication::applicationFilePath());
 
-    QSettings scheme(kClasses + "\\throne", QSettings::NativeFormat);
-    scheme.setValue("Default", "URL:Throne Protocol");
+    QSettings scheme(kClasses + "\\" + kUrlScheme, QSettings::NativeFormat);
+    scheme.setValue("Default", "URL:ProxyCore Protocol");
     scheme.setValue("URL Protocol", "");
     scheme.setValue("shell/open/command/Default", command);
 
     QSettings progId(kClasses + "\\" + kProgId, QSettings::NativeFormat);
-    progId.setValue("Default", "Throne profile");
+    progId.setValue("Default", "ProxyCore profile");
     progId.setValue("DefaultIcon/Default", exe + ",0");
     progId.setValue("shell/open/command/Default", command);
 
@@ -63,7 +67,7 @@ void UrlScheme_Apply() {
 
     // Applications\<exe> is what "Open with > Choose another app" reads, the only route for an extensionless file.
     QSettings app(kClasses + "\\Applications\\" + QFileInfo(exe).fileName(), QSettings::NativeFormat);
-    app.setValue("FriendlyAppName", "Throne");
+    app.setValue("FriendlyAppName", "ProxyCore");
     app.setValue("shell/open/command/Default", command);
     for (const QString &ext : kConfigExtensions) {
         app.setValue("SupportedTypes/" + ext, "");
@@ -79,7 +83,7 @@ void UrlScheme_Apply() {
 void UrlScheme_Remove() {
     // Removing from the parent key drops the whole subtree; QSettings::remove("") would only empty it and leave the node behind.
     QSettings classes(kClasses, QSettings::NativeFormat);
-    classes.remove("throne");
+    classes.remove(kUrlScheme);
     classes.remove(kProgId);
     classes.remove("Applications/" + QFileInfo(QApplication::applicationFilePath()).fileName());
     classes.sync();

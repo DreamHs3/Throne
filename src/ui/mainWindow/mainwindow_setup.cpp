@@ -204,7 +204,9 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), ui(new Ui::MainWi
     bool coreDebugMode = (Configs::dataManager->settingsRepo->log_level == "debug");
 
     Configs::dataManager->settingsRepo->core_socket_name =
-        "throneIPC-" + QUuid::createUuid().toString(QUuid::WithoutBraces);
+        // Per-run pipe name; the prefix marks the ProxyCore instance so a
+        // simultaneously running Throne can never observe this pipe.
+        "proxycoreIPC-" + QUuid::createUuid().toString(QUuid::WithoutBraces);
     core_server = new QLocalServer(this);
     core_server->setSocketOptions(QLocalServer::UserAccessOption);
     if (!core_server->listen(Configs::dataManager->settingsRepo->core_socket_name)) {
@@ -306,7 +308,10 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), ui(new Ui::MainWi
         }
     }
 
-    software_name = "Throne";
+    // Visible identity (PC-010). Internal executable/module names stay
+    // Throne/ThroneCore (parentcheck + IPC contract); only the shown name is
+    // ProxyCore.
+    software_name = "ProxyCore";
     software_core_name = "sing-box";
     if (auto dashDir = QDir("dashboard"); !dashDir.exists() && QDir().mkdir("dashboard")) {
         if (auto dashFile = QFile(":/Throne/dashboard-notice.html"); dashFile.exists() && dashFile.open(QIODevice::ReadOnly))
