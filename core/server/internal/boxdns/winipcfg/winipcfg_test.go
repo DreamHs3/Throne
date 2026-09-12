@@ -84,7 +84,7 @@ func getTestIPInterface(family AddressFamily) (*MibIPInterfaceRow, error) {
 func TestAdaptersAddresses(t *testing.T) {
 	ifcs, err := GetAdaptersAddresses(windows.AF_UNSPEC, GAAFlagIncludeAll)
 	if err != nil {
-		t.Errorf("GetAdaptersAddresses() returned error: %w", err)
+		t.Errorf("GetAdaptersAddresses() returned error: %v", err)
 	} else if ifcs == nil {
 		t.Errorf("GetAdaptersAddresses() returned nil.")
 	} else if len(ifcs) == 0 {
@@ -108,7 +108,7 @@ func TestAdaptersAddresses(t *testing.T) {
 	for _, i := range ifcs {
 		ifc, err := i.LUID.Interface()
 		if err != nil {
-			t.Errorf("LUID.Interface() returned an error: %w", err)
+			t.Errorf("LUID.Interface() returned an error: %v", err)
 			continue
 		} else if ifc == nil {
 			t.Errorf("LUID.Interface() returned nil.")
@@ -119,7 +119,7 @@ func TestAdaptersAddresses(t *testing.T) {
 	for _, i := range ifcs {
 		guid, err := i.LUID.GUID()
 		if err != nil {
-			t.Errorf("LUID.GUID() returned an error: %w", err)
+			t.Errorf("LUID.GUID() returned an error: %v", err)
 			continue
 		}
 		if guid == nil {
@@ -129,7 +129,7 @@ func TestAdaptersAddresses(t *testing.T) {
 
 		luid, err := LUIDFromGUID(guid)
 		if err != nil {
-			t.Errorf("LUIDFromGUID() returned an error: %w", err)
+			t.Errorf("LUIDFromGUID() returned an error: %v", err)
 			continue
 		}
 		if luid != i.LUID {
@@ -142,7 +142,7 @@ func TestAdaptersAddresses(t *testing.T) {
 func TestIPInterface(t *testing.T) {
 	ifcs, err := GetAdaptersAddresses(windows.AF_UNSPEC, GAAFlagDefault)
 	if err != nil {
-		t.Errorf("GetAdaptersAddresses() returned error: %w", err)
+		t.Errorf("GetAdaptersAddresses() returned error: %v", err)
 	}
 
 	for _, i := range ifcs {
@@ -152,12 +152,12 @@ func TestIPInterface(t *testing.T) {
 			continue
 		}
 		if err != nil {
-			t.Errorf("LUID.IPInterface(%s) returned an error: %w", i.FriendlyName(), err)
+			t.Errorf("LUID.IPInterface(%s) returned an error: %v", i.FriendlyName(), err)
 		}
 
 		_, err = i.LUID.IPInterface(windows.AF_INET6)
 		if err != nil {
-			t.Errorf("LUID.IPInterface(%s) returned an error: %w", i.FriendlyName(), err)
+			t.Errorf("LUID.IPInterface(%s) returned an error: %v", i.FriendlyName(), err)
 		}
 	}
 }
@@ -165,7 +165,7 @@ func TestIPInterface(t *testing.T) {
 func TestIPInterfaces(t *testing.T) {
 	tab, err := GetIPInterfaceTable(windows.AF_UNSPEC)
 	if err != nil {
-		t.Errorf("GetIPInterfaceTable() returned an error: %w", err)
+		t.Errorf("GetIPInterfaceTable() returned an error: %v", err)
 		return
 	} else if tab == nil {
 		t.Error("GetIPInterfaceTable() returned nil.")
@@ -180,7 +180,7 @@ func TestIPInterfaces(t *testing.T) {
 func TestIPChangeMetric(t *testing.T) {
 	ipifc, err := getTestIPInterface(windows.AF_INET)
 	if err != nil {
-		t.Errorf("getTestIPInterface() returned an error: %w", err)
+		t.Errorf("getTestIPInterface() returned an error: %v", err)
 		return
 	}
 	if !runningElevated() {
@@ -199,13 +199,13 @@ func TestIPChangeMetric(t *testing.T) {
 		}
 	})
 	if err != nil {
-		t.Errorf("RegisterInterfaceChangeCallback() returned error: %w", err)
+		t.Errorf("RegisterInterfaceChangeCallback() returned error: %v", err)
 		return
 	}
 	defer func() {
 		err = cb.Unregister()
 		if err != nil {
-			t.Errorf("UnregisterInterfaceChangeCallback() returned error: %w", err)
+			t.Errorf("UnregisterInterfaceChangeCallback() returned error: %v", err)
 		}
 	}()
 
@@ -221,14 +221,14 @@ func TestIPChangeMetric(t *testing.T) {
 	ipifc.Metric = newMetric
 	err = ipifc.Set()
 	if err != nil {
-		t.Errorf("MibIPInterfaceRow.Set() returned an error: %w", err)
+		t.Errorf("MibIPInterfaceRow.Set() returned an error: %v", err)
 	}
 
 	time.Sleep(500 * time.Millisecond)
 
 	ipifc, err = getTestIPInterface(windows.AF_INET)
 	if err != nil {
-		t.Errorf("getTestIPInterface() returned an error: %w", err)
+		t.Errorf("getTestIPInterface() returned an error: %v", err)
 		return
 	}
 	if ipifc.Metric != newMetric {
@@ -246,14 +246,14 @@ func TestIPChangeMetric(t *testing.T) {
 	ipifc.Metric = metric
 	err = ipifc.Set()
 	if err != nil {
-		t.Errorf("MibIPInterfaceRow.Set() returned an error: %w", err)
+		t.Errorf("MibIPInterfaceRow.Set() returned an error: %v", err)
 	}
 
 	time.Sleep(500 * time.Millisecond)
 
 	ipifc, err = getTestIPInterface(windows.AF_INET)
 	if err != nil {
-		t.Errorf("getTestIPInterface() returned an error: %w", err)
+		t.Errorf("getTestIPInterface() returned an error: %v", err)
 		return
 	}
 	if ipifc.Metric != metric {
@@ -270,7 +270,7 @@ func TestIPChangeMetric(t *testing.T) {
 func TestIPChangeMTU(t *testing.T) {
 	ipifc, err := getTestIPInterface(windows.AF_INET)
 	if err != nil {
-		t.Errorf("getTestIPInterface() returned an error: %w", err)
+		t.Errorf("getTestIPInterface() returned an error: %v", err)
 		return
 	}
 	if !runningElevated() {
@@ -283,14 +283,14 @@ func TestIPChangeMTU(t *testing.T) {
 	ipifc.NLMTU = mtuToSet
 	err = ipifc.Set()
 	if err != nil {
-		t.Errorf("Interface.Set() returned error: %w", err)
+		t.Errorf("Interface.Set() returned error: %v", err)
 	}
 
 	time.Sleep(500 * time.Millisecond)
 
 	ipifc, err = getTestIPInterface(windows.AF_INET)
 	if err != nil {
-		t.Errorf("getTestIPInterface() returned an error: %w", err)
+		t.Errorf("getTestIPInterface() returned an error: %v", err)
 		return
 	}
 	if ipifc.NLMTU != mtuToSet {
@@ -300,14 +300,14 @@ func TestIPChangeMTU(t *testing.T) {
 	ipifc.NLMTU = prevMTU
 	err = ipifc.Set()
 	if err != nil {
-		t.Errorf("Interface.Set() returned error: %w", err)
+		t.Errorf("Interface.Set() returned error: %v", err)
 	}
 
 	time.Sleep(500 * time.Millisecond)
 
 	ipifc, err = getTestIPInterface(windows.AF_INET)
 	if err != nil {
-		t.Errorf("getTestIPInterface() returned an error: %w", err)
+		t.Errorf("getTestIPInterface() returned an error: %v", err)
 	}
 	if ipifc.NLMTU != prevMTU {
 		t.Errorf("Interface.NLMTU is %d although %d is expected.", ipifc.NLMTU, prevMTU)
@@ -317,13 +317,13 @@ func TestIPChangeMTU(t *testing.T) {
 func TestGetIfRow(t *testing.T) {
 	ifc, err := getTestInterface()
 	if err != nil {
-		t.Errorf("getTestInterface() returned an error: %w", err)
+		t.Errorf("getTestInterface() returned an error: %v", err)
 		return
 	}
 
 	row, err := ifc.LUID.Interface()
 	if err != nil {
-		t.Errorf("LUID.Interface() returned an error: %w", err)
+		t.Errorf("LUID.Interface() returned an error: %v", err)
 		return
 	}
 
@@ -336,7 +336,7 @@ func TestGetIfRow(t *testing.T) {
 func TestGetIfRows(t *testing.T) {
 	tab, err := GetIfTable2Ex(MibIfEntryNormal)
 	if err != nil {
-		t.Errorf("GetIfTable2Ex() returned an error: %w", err)
+		t.Errorf("GetIfTable2Ex() returned an error: %v", err)
 		return
 	} else if tab == nil {
 		t.Errorf("GetIfTable2Ex() returned nil")
@@ -354,7 +354,7 @@ func TestGetIfRows(t *testing.T) {
 func TestUnicastIPAddress(t *testing.T) {
 	_, err := GetUnicastIPAddressTable(windows.AF_UNSPEC)
 	if err != nil {
-		t.Errorf("GetUnicastAddresses() returned an error: %w", err)
+		t.Errorf("GetUnicastAddresses() returned an error: %v", err)
 		return
 	}
 }
@@ -362,7 +362,7 @@ func TestUnicastIPAddress(t *testing.T) {
 func TestAddDeleteIPAddress(t *testing.T) {
 	ifc, err := getTestInterface()
 	if err != nil {
-		t.Errorf("getTestInterface() returned an error: %w", err)
+		t.Errorf("getTestInterface() returned an error: %v", err)
 		return
 	}
 	if !runningElevated() {
@@ -375,7 +375,7 @@ func TestAddDeleteIPAddress(t *testing.T) {
 		t.Errorf("Unicast address %s already exists. Please set nonexistantIPv4ToAdd appropriately.", nonexistantIPv4ToAdd.Addr().String())
 		return
 	} else if err != windows.ERROR_NOT_FOUND {
-		t.Errorf("LUID.IPAddress() returned an error: %w", err)
+		t.Errorf("LUID.IPAddress() returned an error: %v", err)
 		return
 	}
 
@@ -392,7 +392,7 @@ func TestAddDeleteIPAddress(t *testing.T) {
 		}
 	})
 	if err != nil {
-		t.Errorf("RegisterUnicastAddressChangeCallback() returned an error: %w", err)
+		t.Errorf("RegisterUnicastAddressChangeCallback() returned an error: %v", err)
 	} else {
 		defer cb.Unregister()
 	}
@@ -402,7 +402,7 @@ func TestAddDeleteIPAddress(t *testing.T) {
 	}
 	err = ifc.LUID.AddIPAddresses([]netip.Prefix{nonexistantIPv4ToAdd})
 	if err != nil {
-		t.Errorf("LUID.AddIPAddresses() returned an error: %w", err)
+		t.Errorf("LUID.AddIPAddresses() returned an error: %v", err)
 	}
 
 	time.Sleep(500 * time.Millisecond)
@@ -416,7 +416,7 @@ func TestAddDeleteIPAddress(t *testing.T) {
 	}
 	addr, err = ifc.LUID.IPAddress(nonexistantIPv4ToAdd.Addr())
 	if err != nil {
-		t.Errorf("LUID.IPAddress() returned an error: %w", err)
+		t.Errorf("LUID.IPAddress() returned an error: %v", err)
 	} else if addr == nil {
 		t.Errorf("Unicast address %s still doesn't exist, although it's added successfully.", nonexistantIPv4ToAdd.Addr().String())
 	}
@@ -426,7 +426,7 @@ func TestAddDeleteIPAddress(t *testing.T) {
 
 	err = ifc.LUID.DeleteIPAddress(nonexistantIPv4ToAdd)
 	if err != nil {
-		t.Errorf("LUID.DeleteIPAddress() returned an error: %w", err)
+		t.Errorf("LUID.DeleteIPAddress() returned an error: %v", err)
 	}
 
 	time.Sleep(500 * time.Millisecond)
@@ -435,7 +435,7 @@ func TestAddDeleteIPAddress(t *testing.T) {
 	if err == nil {
 		t.Errorf("Unicast address %s still exists, although it's deleted successfully.", nonexistantIPv4ToAdd.Addr().String())
 	} else if err != windows.ERROR_NOT_FOUND {
-		t.Errorf("LUID.IPAddress() returned an error: %w", err)
+		t.Errorf("LUID.IPAddress() returned an error: %v", err)
 	}
 	if !deleted {
 		t.Errorf("Notification handler has not been called on delete.")
@@ -445,7 +445,7 @@ func TestAddDeleteIPAddress(t *testing.T) {
 func TestGetRoutes(t *testing.T) {
 	_, err := GetIPForwardTable2(windows.AF_UNSPEC)
 	if err != nil {
-		t.Errorf("GetIPForwardTable2() returned error: %w", err)
+		t.Errorf("GetIPForwardTable2() returned error: %v", err)
 	}
 }
 
@@ -474,7 +474,7 @@ func TestAddDeleteRoute(t *testing.T) {
 
 	ifc, err := getTestInterface()
 	if err != nil {
-		t.Errorf("getTestInterface() returned an error: %w", err)
+		t.Errorf("getTestInterface() returned an error: %v", err)
 		return
 	}
 	if !runningElevated() {
@@ -487,13 +487,13 @@ func TestAddDeleteRoute(t *testing.T) {
 		t.Error("LUID.Route() returned a route although it isn't added yet. Have you forgot to set nonexistentRouteIPv4ToAdd appropriately?")
 		return
 	} else if err != windows.ERROR_NOT_FOUND {
-		t.Errorf("LUID.Route() returned an error: %w", err)
+		t.Errorf("LUID.Route() returned an error: %v", err)
 		return
 	}
 
 	routes, err := findRoute(ifc.LUID, nonexistentRouteIPv4ToAdd.Destination)
 	if err != nil {
-		t.Errorf("findRoute() returned an error: %w", err)
+		t.Errorf("findRoute() returned an error: %v", err)
 	} else if len(routes) != 0 {
 		t.Errorf("findRoute() returned %d items although the route isn't added yet. Have you forgot to set nonexistentRouteIPv4ToAdd appropriately?", len(routes))
 	}
@@ -508,13 +508,13 @@ func TestAddDeleteRoute(t *testing.T) {
 		}
 	})
 	if err != nil {
-		t.Errorf("RegisterRouteChangeCallback() returned an error: %w", err)
+		t.Errorf("RegisterRouteChangeCallback() returned an error: %v", err)
 	} else {
 		defer cb.Unregister()
 	}
 	err = ifc.LUID.AddRoute(nonexistentRouteIPv4ToAdd.Destination, nonexistentRouteIPv4ToAdd.NextHop, nonexistentRouteIPv4ToAdd.Metric)
 	if err != nil {
-		t.Errorf("LUID.AddRoute() returned an error: %w", err)
+		t.Errorf("LUID.AddRoute() returned an error: %v", err)
 	}
 
 	time.Sleep(500 * time.Millisecond)
@@ -523,7 +523,7 @@ func TestAddDeleteRoute(t *testing.T) {
 	if err == windows.ERROR_NOT_FOUND {
 		t.Error("LUID.Route() returned nil although the route is added successfully.")
 	} else if err != nil {
-		t.Errorf("LUID.Route() returned an error: %w", err)
+		t.Errorf("LUID.Route() returned an error: %v", err)
 	} else if route.DestinationPrefix.RawPrefix.Addr() != nonexistentRouteIPv4ToAdd.Destination.Addr() || route.NextHop.Addr() != nonexistentRouteIPv4ToAdd.NextHop {
 		t.Error("LUID.Route() returned a wrong route!")
 	}
@@ -533,7 +533,7 @@ func TestAddDeleteRoute(t *testing.T) {
 
 	routes, err = findRoute(ifc.LUID, nonexistentRouteIPv4ToAdd.Destination)
 	if err != nil {
-		t.Errorf("findRoute() returned an error: %w", err)
+		t.Errorf("findRoute() returned an error: %v", err)
 	} else if len(routes) != 1 {
 		t.Errorf("findRoute() returned %d items although %d is expected.", len(routes), 1)
 	} else if routes[0].DestinationPrefix.RawPrefix.Addr() != nonexistentRouteIPv4ToAdd.Destination.Addr() {
@@ -542,7 +542,7 @@ func TestAddDeleteRoute(t *testing.T) {
 
 	err = ifc.LUID.DeleteRoute(nonexistentRouteIPv4ToAdd.Destination, nonexistentRouteIPv4ToAdd.NextHop)
 	if err != nil {
-		t.Errorf("LUID.DeleteRoute() returned an error: %w", err)
+		t.Errorf("LUID.DeleteRoute() returned an error: %v", err)
 	}
 
 	time.Sleep(500 * time.Millisecond)
@@ -551,7 +551,7 @@ func TestAddDeleteRoute(t *testing.T) {
 	if err == nil {
 		t.Error("LUID.Route() returned a route although it is removed successfully.")
 	} else if err != windows.ERROR_NOT_FOUND {
-		t.Errorf("LUID.Route() returned an error: %w", err)
+		t.Errorf("LUID.Route() returned an error: %v", err)
 	}
 	if !deleted {
 		t.Errorf("Route handler has not been called on delete.")
@@ -559,7 +559,7 @@ func TestAddDeleteRoute(t *testing.T) {
 
 	routes, err = findRoute(ifc.LUID, nonexistentRouteIPv4ToAdd.Destination)
 	if err != nil {
-		t.Errorf("findRoute() returned an error: %w", err)
+		t.Errorf("findRoute() returned an error: %v", err)
 	} else if len(routes) != 0 {
 		t.Errorf("findRoute() returned %d items although the route is deleted successfully.", len(routes))
 	}
@@ -568,7 +568,7 @@ func TestAddDeleteRoute(t *testing.T) {
 func TestFlushDNS(t *testing.T) {
 	ifc, err := getTestInterface()
 	if err != nil {
-		t.Errorf("getTestInterface() returned an error: %w", err)
+		t.Errorf("getTestInterface() returned an error: %v", err)
 		return
 	}
 	if !runningElevated() {
@@ -578,12 +578,12 @@ func TestFlushDNS(t *testing.T) {
 
 	prevDNSes, err := ifc.LUID.DNS()
 	if err != nil {
-		t.Errorf("LUID.DNS() returned an error: %w", err)
+		t.Errorf("LUID.DNS() returned an error: %v", err)
 	}
 
 	err = ifc.LUID.FlushDNS(syscall.AF_INET)
 	if err != nil {
-		t.Errorf("LUID.FlushDNS() returned an error: %w", err)
+		t.Errorf("LUID.FlushDNS() returned an error: %v", err)
 	}
 
 	ifc, _ = getTestInterface()
@@ -591,7 +591,7 @@ func TestFlushDNS(t *testing.T) {
 	n := 0
 	dns, err := ifc.LUID.DNS()
 	if err != nil {
-		t.Errorf("LUID.DNS() returned an error: %w", err)
+		t.Errorf("LUID.DNS() returned an error: %v", err)
 	}
 	for _, a := range dns {
 		if a.Is4() {
@@ -611,7 +611,7 @@ func TestFlushDNS(t *testing.T) {
 func TestSetDNS(t *testing.T) {
 	ifc, err := getTestInterface()
 	if err != nil {
-		t.Errorf("getTestInterface() returned an error: %w", err)
+		t.Errorf("getTestInterface() returned an error: %v", err)
 		return
 	}
 	if !runningElevated() {
@@ -621,12 +621,12 @@ func TestSetDNS(t *testing.T) {
 
 	prevDNSes, err := ifc.LUID.DNS()
 	if err != nil {
-		t.Errorf("LUID.DNS() returned an error: %w", err)
+		t.Errorf("LUID.DNS() returned an error: %v", err)
 	}
 
 	err = ifc.LUID.SetDNS(windows.AF_INET, dnsesToSet, nil)
 	if err != nil {
-		t.Errorf("LUID.SetDNS() returned an error: %w", err)
+		t.Errorf("LUID.SetDNS() returned an error: %v", err)
 		return
 	}
 
@@ -634,7 +634,7 @@ func TestSetDNS(t *testing.T) {
 
 	newDNSes, err := ifc.LUID.DNS()
 	if err != nil {
-		t.Errorf("LUID.DNS() returned an error: %w", err)
+		t.Errorf("LUID.DNS() returned an error: %v", err)
 	} else if len(newDNSes) != len(dnsesToSet) {
 		t.Errorf("dnsesToSet contains %d items, while DNSServerAddresses contains %d.", len(dnsesToSet), len(newDNSes))
 	} else {
@@ -654,7 +654,7 @@ func TestSetDNS(t *testing.T) {
 func TestAnycastIPAddress(t *testing.T) {
 	_, err := GetAnycastIPAddressTable(windows.AF_UNSPEC)
 	if err != nil {
-		t.Errorf("GetAnycastIPAddressTable() returned an error: %w", err)
+		t.Errorf("GetAnycastIPAddressTable() returned an error: %v", err)
 		return
 	}
 }

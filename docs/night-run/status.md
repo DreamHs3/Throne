@@ -95,3 +95,80 @@ Session date: 2026-09-12 (night), autonomous run.
   10. VM-only tests listed separately — YES (final-report §9).
 - Decision: transition to the service spike branch is ALLOWED; VM-bound items
   stay BLOCKED and are carried into the spike base notes.
+
+## Remediation round 2 — 2026-09-12 (PC-100 config policy + identity boundary; PC-010/PC-020 follow-ups)
+
+Branch: `agent/night-stage1-service-spike`, start HEAD `041b0978`
+(`fix(PC-100): restrict privileged service RPC surface`). Continuation of the
+interrupted round per `docs/night-run/handoff-2026-09-12.md`.
+
+- [PC-100] New `core/server/service_windows_policy_windows_test.go` (9 tests):
+  rejection matrix over **every** deny key + IPC/device value prefixes (41
+  cases), disabled-cache_file path drop, passthrough boundaries, normalization
+  (`THRONE_SERVICE_DATA_DIR`), fail-closed without data dir, Xray document
+  policy, wire end-to-end traversal matrix (hostile cache paths — absolute,
+  `..\`, real NTFS junction — Start accepted, `cache.db` lands ONLY in the
+  service data dir, foreign destinations untouched, Start/CheckConfig parity
+  both directions), SDDL override guard, ADR-001 admission policy, and a REAL
+  winio pipe identity round trip (own-SID DACL + allowlist → handshake served;
+  denial branch adaptive to runner elevation).
+- [PC-100] Deny list rebuilt from an enumeration of all filesystem-bearing
+  keys in the pinned sing-box `option` package: 24 keys beyond the initial
+  review list added (mTLS/CA/MCA/CRL/static-key certs, openconnect
+  secret/wrapper, ocm/ccm credential/usages, tailscale state/taildrop/mesh
+  PSK/derp config, ECH config_path, acme/origin_ca/tor data_directory,
+  ssmapi cache_path, rule-set initial_path, tor executable_path, tun
+  protect_path, netns pid_file, dhcp lease files, hysteria2 masquerade
+  directory). `process_path`/`process_path_regex`/DERP `home` deliberately
+  allowed (matchers/route, not file access).
+- [PC-100] Three round-1 defects caught by the new tests and fixed:
+  (1) `cache_file.path` exemption never fired (parent-vs-child walk path) —
+  the policy rejected its own normalized configs; (2) `sddlGrantsTrustee`
+  matched nothing (split off-by-one + trustee is the last ACE field) — the
+  WD/AN/AU/BU ban was dead code; (3) `clientTokenIdentity` panicked on any
+  token with >1 group (`Groups[:GroupCount]` on a fixed `[1]` array) — fixed
+  via `unsafe.Slice` (`tokenGroupSIDs`).
+- [PC-100] Suite: `go test -count=20` — 24 tests × 20 runs ok; regression
+  `.` + `internal/xray` + `internal/xraydns` ok; gofmt/vet/build (CI tags)
+  clean; `git diff --check` clean.
+- [PC-100] Status: **still BLOCKED** (SCM start/stop, non-elevated client
+  refusal, SDDL-refusal under a normal user — VM only). The code-level
+  config-policy gap from round 1 is closed; see pc-100-report.md §"Remediation
+  round 2" and ADR-002 addendum №2.
+- [PC-100] vet note: the only remaining `go vet ./...` finding (with `-a`) is
+  a pre-existing upstream `unreachable code` duplicate `return nil` at
+  `internal/boxdns/dns_manager_windows.go:246` — pinned DNS machinery, outside
+  the allowed edit surface. The winipcfg `%w` vet debt (52 sites, test code
+  only) eliminated this round. Caution: `go vet` result caching can report a
+  stale pass; verify with `-a`.
+- [PC-010] `DefaultThroneDataDir()` → `…/Throne/config` (Throne keeps its data
+  in a config subdirectory); header comment + `TestCoexistence` updated
+  (`Throne/config`, parent dir still `Throne`).
+- [PC-010] `copyIntoStaging` no longer plain-copies SQLite databases:
+  `*.db-wal`/`*.db-shm` are skipped as files; each `*.db` is copied to
+  `<name>.raw` (+ renamed sidecars), opened read-write so SQLite recovers the
+  WAL in our copy, and replaced by a consistent `SQLite::Backup` snapshot
+  (same WAL-safe pattern as `Database::backupSelective`,
+  src/database/Database.cpp:317); raw artifacts removed; `SQLite::Exception`
+  → typed error. Compile-blind (no C++ toolchain on this machine).
+- [PC-010] Tests: `makeThroneSource` now creates a REAL SQLite database;
+  new `testMigrateLiveWalDatabase` — writer connection held open in WAL mode
+  (committed row lives in `-wal`), migration lands a readable database at the
+  target, no `-wal`/`-shm` shipped, live source + open writer untouched;
+  `proxycore_tests` now compiles SQLiteCpp (Backup/Column/Database/Exception/
+  Savepoint/Statement/Transaction + sqlite3.c) with the SQLiteCpp include
+  path. Execution still BLOCKED (no C++ toolchain) — documented.
+- [PC-020] `script/build_go.sh`: the upstream updater download block removed
+  (windows/linux release packaging no longer ships `updater(.exe)`;
+  libcronet/darwin/linux branches untouched, `bash -n` verified).
+- [PC-020] `script/windows_installer.iss`: `[UninstallDelete]` section for
+  `{app}\updater.old` removed — ProxyCore no longer ships the updater.
+- [PC-020] Guard v2: `check_no_updater.sh` now also scans `script/` and
+  `.github/workflows/` for the word `updater` (case-insensitive); self-tested
+  the failure path (junk file → exit 1) and the clean path (exit 0).
+- [round] `core/server/gen/libcore.proto` (+23 lines) remains the owner's
+  PC-110 WIP: NOT committed in any of this round's commits, still present in
+  the working tree.
+- [round] Final check: 4 commits `fix(PC-100)` / `fix(PC-010)` / `fix(PC-020)`
+  / `fix(tests)`; PC-100 remains BLOCKED until VM runs; no push/PR/tag; no
+  service installed; winipcfg network tests not executed on this machine.
