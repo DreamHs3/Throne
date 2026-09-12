@@ -20,11 +20,14 @@ import (
 	"net"
 	"os"
 	runtimeDebug "runtime/debug"
+	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/tailscale/go-winio"
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"google.golang.org/protobuf/proto"
 )
@@ -94,11 +97,45 @@ func servicePipeName() string {
 	return defaultServicePipeName
 }
 
-func serviceSDDL() string {
+func serviceSDDL() (string, error) {
 	if v := os.Getenv("THRONE_SERVICE_SDDL"); v != "" {
-		return v
+		return safeServiceSDDL(v)
 	}
-	return defaultServiceSDDL
+	return defaultServiceSDDL, nil
+}
+
+// safeServiceSDDL protects the SDDL override from unsafe substitution. A
+// usable DACL must be protected ("D:P" - inherited ACEs off) and must not
+// grant access to broad trustees: Everyone (WD), Anonymous (AN),
+// Authenticated Users (AU) or Builtin Users (BU). Per-user SID grants
+// ("A;;GA;;;S-1-5-21-...") and SYSTEM/ADMINISTRATORS remain fine. An unsafe
+// override fails the listener start - never a silent fallback to something
+// broader.
+func safeServiceSDDL(sddl string) (string, error) {
+	if !strings.HasPrefix(sddl, "D:P") {
+		return "", fmt.Errorf("%s: service SDDL must start with a protected DACL (D:P)", errInvalidRequest)
+	}
+	for _, trustee := range []string{"WD", "AN", "AU", "BU"} {
+		if sddlGrantsTrustee(sddl, trustee) {
+			return "", fmt.Errorf("%s: service SDDL must not grant access to %s", errInvalidRequest, trustee)
+		}
+	}
+	return sddl, nil
+}
+
+// sddlGrantsTrustee reports whether any allow ACE in the SDDL string grants
+// access to the given trustee abbreviation. An ACE body is
+// type;flags;rights;objectGUID;inheritGUID;trustee — the "(A;" split consumes
+// the type and its delimiter, so the trustee is the last remaining field.
+// Deliberately simple: exact match on the trustee field of each allow ACE.
+func sddlGrantsTrustee(sddl string, trustee string) bool {
+	for _, ace := range strings.Split(sddl, "(A;") {
+		fields := strings.Split(strings.TrimSuffix(ace, ")"), ";")
+		if len(fields) > 0 && fields[len(fields)-1] == trustee {
+			return true
+		}
+	}
+	return false
 }
 
 // applyServiceModeSettings pins spike-level runtime settings. The GUI child
@@ -109,8 +146,12 @@ func applyServiceModeSettings() {
 }
 
 func listenServicePipe() (net.Listener, error) {
+	sddl, err := serviceSDDL()
+	if err != nil {
+		return nil, err
+	}
 	return winio.ListenPipe(servicePipeName(), &winio.PipeConfig{
-		SecurityDescriptor: serviceSDDL(),
+		SecurityDescriptor: sddl,
 		InputBufferSize:    65536,
 		OutputBufferSize:   65536,
 	})
@@ -173,6 +214,155 @@ func waitServiceHandlers(d time.Duration) {
 	}
 }
 
+// serveServiceListener is the accept loop. Every client is authorized by
+// token identity before it can reach the handshake, let alone a method.
+func serveServiceListener(listener net.Listener, conns *connSet, stopCh <-chan struct{}) {
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			select {
+			case <-stopCh:
+				return
+			default:
+				log.Printf("service pipe accept error: %v", err)
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+		}
+		if !authorizeServiceClient(conn) {
+			_ = conn.Close()
+			continue
+		}
+		conns.add(conn)
+		go func() {
+			defer conns.remove(conn)
+			serveServiceConn(conn)
+		}()
+	}
+}
+
+// builtinAdministratorsSID is the Windows built-in Administrators group;
+// ADR-001 admits it alongside the installing owner's SID.
+const builtinAdministratorsSID = "S-1-5-32-544"
+
+// authorizeServiceClient is a hook so tests can drive the accept loop with
+// stub identities; production always uses authorizeServiceClientReal.
+var authorizeServiceClient = authorizeServiceClientReal
+
+// authorizeServiceClientReal resolves the connecting process's token and
+// applies the ADR-001 identity policy: the configured owner SID(s) and
+// Administrators. Unknown or unresolvable identities are denied (fail closed)
+// and only the SID - never any payload - is logged.
+func authorizeServiceClientReal(conn net.Conn) bool {
+	sid, groups, ok := clientTokenIdentity(conn)
+	if !ok {
+		log.Printf("service client rejected: client identity unavailable")
+		return false
+	}
+	if serviceClientAllowed(sid, groups) {
+		return true
+	}
+	log.Printf("service client rejected: sid %s is not in the allowed set", sid)
+	return false
+}
+
+// serviceClientAllowed is the pure ADR-001 identity policy.
+func serviceClientAllowed(sid string, groups []string) bool {
+	for _, group := range groups {
+		if group == builtinAdministratorsSID {
+			return true
+		}
+	}
+	for _, allowed := range allowedServiceSIDs() {
+		if sid != "" && sid == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+// allowedServiceSIDs lists the installing owner's SID(s), configured via
+// THRONE_SERVICE_ALLOWED_SIDS (comma separated). The installer (PC-120) owns
+// this setting; with it unset only Administrators are admitted.
+func allowedServiceSIDs() []string {
+	var out []string
+	for _, item := range strings.Split(os.Getenv("THRONE_SERVICE_ALLOWED_SIDS"), ",") {
+		if trimmed := strings.TrimSpace(item); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+// clientTokenIdentity resolves the pipe client's user SID and group SIDs.
+// The identity is bound to the connection's client process at accept time;
+// a client spawning other processes later changes nothing about this check.
+func clientTokenIdentity(conn net.Conn) (string, []string, bool) {
+	fdc, ok := conn.(interface{ Fd() uintptr })
+	if !ok {
+		return "", nil, false
+	}
+	var clientPID uint32
+	if err := windows.GetNamedPipeClientProcessId(windows.Handle(fdc.Fd()), &clientPID); err != nil {
+		return "", nil, false
+	}
+	proc, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, clientPID)
+	if err != nil {
+		return "", nil, false
+	}
+	defer windows.CloseHandle(proc)
+	var token windows.Token
+	if err := windows.OpenProcessToken(proc, windows.TOKEN_QUERY, &token); err != nil {
+		return "", nil, false
+	}
+	defer token.Close()
+
+	tokenUser, err := tokenInformation(token, windows.TokenUser)
+	if err != nil {
+		return "", nil, false
+	}
+	sid := (*windows.Tokenuser)(unsafe.Pointer(&tokenUser[0])).User.Sid.String()
+
+	var groups []string
+	if tokenGroupsBuf, err := tokenInformation(token, windows.TokenGroups); err == nil {
+		groups = tokenGroupSIDs(tokenGroupsBuf)
+	}
+	return sid, groups, true
+}
+
+// tokenGroupSIDs decodes a TokenGroups buffer into group SID strings. The
+// Groups field is a fixed-size [1]SIDAndAttributes array whose real length is
+// GroupCount, so the members are re-sliced unsafely — indexing the array
+// directly panics for any token with more than one group.
+func tokenGroupSIDs(buf []byte) []string {
+	if len(buf) < 4 {
+		return nil
+	}
+	info := (*windows.Tokengroups)(unsafe.Pointer(&buf[0]))
+	if info.GroupCount == 0 {
+		return nil
+	}
+	members := unsafe.Slice((*windows.SIDAndAttributes)(unsafe.Pointer(&info.Groups[0])), info.GroupCount)
+	var out []string
+	for _, member := range members {
+		out = append(out, member.Sid.String())
+	}
+	return out
+}
+
+// tokenInformation queries a token information class into a fresh buffer.
+func tokenInformation(token windows.Token, class uint32) ([]byte, error) {
+	var needed uint32
+	if err := windows.GetTokenInformation(token, class, nil, 0, &needed); err != nil && needed == 0 {
+		return nil, err
+	}
+	buf := make([]byte, needed)
+	if err := windows.GetTokenInformation(token, class, &buf[0], uint32(needed), &needed); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
 type proxyCoreServiceHandler struct{}
 
 // Execute implements svc.Handler. Testable without SCM: feed ChangeRequests
@@ -194,26 +384,7 @@ func (h *proxyCoreServiceHandler) Execute(args []string, r <-chan svc.ChangeRequ
 	var stopOnce sync.Once
 	conns := newConnSet()
 
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				select {
-				case <-stopCh:
-					return
-				default:
-					log.Printf("service pipe accept error: %v", err)
-					time.Sleep(500 * time.Millisecond)
-					continue
-				}
-			}
-			conns.add(conn)
-			go func() {
-				defer conns.remove(conn)
-				serveServiceConn(conn)
-			}()
-		}
-	}()
+	go serveServiceListener(listener, conns, stopCh)
 
 	status <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 
@@ -409,22 +580,31 @@ func (s *server) Health(ctx context.Context, _ *gen.EmptyReq) (*gen.HealthResp, 
 // `*in.CoreConfig`; also :399/:434/:474) and a client that omits a field
 // would otherwise crash the handler — an upstream robustness defect recorded
 // for the PC-110 typed contract, deliberately not patched in server.go.
+// The same filesystem policy as Start is enforced so a config cannot be
+// validated in the morning and run in the evening (what CheckConfig accepts,
+// Start accepts; what Start rejects, CheckConfig rejects).
 func (s *server) ServiceCheckConfig(ctx context.Context, in *gen.LoadConfigReq) (*gen.ErrorResp, error) {
 	normalizeLoadConfigReq(in)
+	coreConfig, err := applyServiceConfigPolicy(in.GetCoreConfig(), configServiceDataDir())
+	if err != nil {
+		return nil, err
+	}
+	in.CoreConfig = proto.String(coreConfig)
+	if err := validateServiceXrayConfigPolicy(in.GetXrayConfig()); err != nil {
+		return nil, err
+	}
 	return globalServer.CheckConfig(ctx, in)
 }
 
 // ServiceStart is the service-mode Start. It rejects the whole extra-process
 // execution surface — arbitrary executable path, arguments and config file —
-// before anything is parsed or spawned, then delegates to the legacy Start.
+// before anything is parsed or spawned, then enforces the filesystem config
+// policy (normalize cache_file/external_ui to service-owned values, reject
+// every other path-bearing field), then delegates to the legacy Start.
 //
-// Remaining (documented, unresolved in PC-100): the core_config/xray_config
-// JSON itself can still point the privileged runtime at arbitrary paths
-// (sing-box log.output / cache_file.path writes, TLS certificate/key reads,
-// Xray log file paths). Proving a safe Start therefore needs a
-// privileged-side config policy; the typed contract for it is PC-110 scope
-// (ADR-001: "Service не доверяет путям/JSON UI"). Until then service-mode
-// Start stays prototype-only and PC-100 stays BLOCKED.
+// What remains outside PC-100 (documented): the typed-parameter contract
+// where the service builds its own configuration end-to-end (PC-110+), the
+// per-user SID grant from the installer (PC-120) and every SCM/VM test.
 func (s *server) ServiceStart(ctx context.Context, in *gen.LoadConfigReq) (*gen.ErrorResp, error) {
 	if in.GetNeedExtraProcess() ||
 		in.GetExtraProcessPath() != "" ||
@@ -437,6 +617,19 @@ func (s *server) ServiceStart(ctx context.Context, in *gen.LoadConfigReq) (*gen.
 		return nil, fmt.Errorf("%s: need_xray requires xray_config", errInvalidRequest)
 	}
 	normalizeLoadConfigReq(in)
+	coreConfig, err := applyServiceConfigPolicy(in.GetCoreConfig(), configServiceDataDir())
+	if err != nil {
+		return nil, err
+	}
+	in.CoreConfig = proto.String(coreConfig)
+	if err := validateServiceXrayConfigPolicy(in.GetXrayConfig()); err != nil {
+		return nil, err
+	}
+	for _, full := range in.GetXrayFullConfigs() {
+		if err := validateServiceXrayConfigPolicy(full); err != nil {
+			return nil, err
+		}
+	}
 	return globalServer.Start(ctx, in)
 }
 

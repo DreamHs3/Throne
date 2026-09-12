@@ -1,12 +1,13 @@
 # PC-100 report — prototype service-capable core runtime
 
-Commit: see `git log` (PC-100: prototype service-capable core runtime; plus
-the remediation commit `fix(PC-100): restrict privileged service RPC surface`).
+Commit: see `git log` (PC-100: prototype service-capable core runtime; plus the
+remediation commits `fix(PC-100): restrict privileged service RPC surface` and
+`fix(PC-100): enforce service config filesystem policy and client identity
+boundary`).
 Branch: `agent/night-stage1-service-spike`. Status: **BLOCKED** — the spike
 code is implemented and all available unit/build checks pass, but the roadmap
 acceptance (SCM start/stop, non-elevated Windows-VM client evidence) has not
-been executed, and a **safe Start cannot be proven within PC-100 boundaries**
-(see "Why BLOCKED" below). BLOCKED is not PASS; **Gate 1 is NOT closed**.
+been executed. BLOCKED is not PASS; **Gate 1 is NOT closed**.
 
 ## Remediation (external review, this commit)
 
@@ -50,26 +51,112 @@ Fix (`core/server/service_windows.go`):
   legacy table structure. Full suite: `go test -count=20` → **ok** (15 tests
   × 20 runs).
 
+## Remediation round 2 — config filesystem policy (ADR-002 addendum #2)
+
+Closes the "Why BLOCKED" item 1 **at the code level** (VM evidence still
+outstanding). Start and CheckConfig now enforce a deny-by-default filesystem
+policy before the privileged runtime sees any client JSON
+(`core/server/service_config_policy.go`, new file):
+
+- **Normalized (never client-controlled)**: `experimental.cache_file.path` is
+  rewritten to `<THRONE_SERVICE_DATA_DIR>/cache.db` — fail-closed with a typed
+  `ERR_CONFIG_POLICY` when cache_file is enabled without a data directory (the
+  service working directory is System32; a working-directory-relative cache
+  path would land there). When cache_file is disabled, a client-supplied path
+  is silently dropped. `experimental.clash_api.external_ui*` keys are removed
+  (the UI is not the core's business, and the values are directories the core
+  would serve or download into).
+- **Rejected (typed `ERR_CONFIG_POLICY`)**: every other filesystem-bearing
+  key, at any depth — log sinks, TLS/OpenVPN/OpenConnect certificate & key
+  paths (client/mTLS, CA, MCA, CRL, static keys, wrapper scripts), SSH
+  `private_key_path`, local/remote rule-set paths, tailscale/ACME/tor
+  directories & executables, Xray `log.access`/`log.error` files (only
+  `none`/empty accepted), Xray `certificateFile`/`keyFile` — plus
+  `unix://`, `\\.\pipe`, `\\.\`, `\\?\` string literals anywhere in the
+  document.
+- **Deny list proven against the pinned sing-box**: the key list was built by
+  enumerating every filesystem-bearing JSON key in the pinned sing-box
+  `option` package. The enumeration surfaced **24 path-bearing keys beyond
+  the review's original list** (`client_certificate_path`, `client_key_path`,
+  `crl_path`, `static_key_path`, `certificate_directory_path`,
+  `certificate_authority_path`, `mca_certificate_path`, `mca_key_path`,
+  `secret_path`, `credential_path`, `usages_path`, `config_path`,
+  `initial_path`, `cache_path`, `data_directory`, `state_directory`,
+  `taildrop_directory`, `mesh_psk_file`, `pid_file`, `dhcp_lease_files`,
+  `directory`, `executable_path`, `wrapper_path`, `protect_path`) — all added.
+  Route matchers (`process_path`, `process_path_regex`) and the DERP `home`
+  HTTP route are deliberately NOT denied: they match or route, the core never
+  opens those values as files, and Throne's per-app proxy may legitimately
+  use them.
+- **One contract for Start and CheckConfig**: what one accepts, the other
+  accepts; what one rejects, the other rejects (asserted over the wire, both
+  directions). `ServiceStart` additionally still rejects the whole
+  extra-process surface (round 1 guard).
+
+## Remediation round 2 — Windows identity boundary (ADR-001)
+
+The default DACL (SYSTEM + Administrators) alone does not identify a client:
+any administrator process could connect, and PC-120 will grant a per-user SID
+at the DACL. The pipe now also authorizes clients **by token identity at
+accept time**, before the handshake:
+
+- `serveServiceListener` → `authorizeServiceClient` (test hook; production
+  `authorizeServiceClientReal`) → `clientTokenIdentity`:
+  `GetNamedPipeClientProcessId` → `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`
+  → `OpenProcessToken(TOKEN_QUERY)` → `TokenUser` + `TokenGroups` SIDs. The
+  identity is bound to the connecting process at accept time.
+- `serviceClientAllowed` — the pure ADR-001 admission policy: the configured
+  owner SID list (`THRONE_SERVICE_ALLOWED_SIDS`, set by the installer PC-120)
+  plus the built-in Administrators group (`S-1-5-32-544`). Unresolvable or
+  unknown identities are denied (fail closed); only the SID — never any
+  payload — is logged.
+- `safeServiceSDDL` protects the SDDL override from unsafe substitution: a
+  usable DACL must be protected (`D:P`) and must not grant access to broad
+  trustees (WD/AN/AU/BU); per-user SID grants remain fine. An unsafe override
+  fails the listener start — never a silent fallback.
+
+### Defects found by the round-2 tests (fixed)
+
+The three defects below were present in the round-1 "ready" code and caught
+only by the new test suite — vet/build alone had passed all of them:
+
+1. **The policy rejected its own normalized configs.** The
+   `experimental.cache_file.path` exemption compared the *parent* walk path
+   against the *child's* full path, so the exemption never fired and every
+   normalized Start was rejected with `ERR_CONFIG_POLICY`.
+2. **The SDDL trustee ban was dead code.** After `strings.Split(sddl, "(A;")`
+   each ACE body keeps a leading `;` (the split consumes `type` + one
+   delimiter), and the trustee is the *last* field of six — the old
+   `SplitN(..., 4)` + `fields[3]` check matched nothing, so a
+   `D:P(A;;GA;;;WD)` override would have been accepted. Fixed: parse to the
+   last semicolon-separated field of each allow ACE.
+3. **`clientTokenIdentity` panicked on any real client.**
+   `Tokengroups.Groups[:GroupCount]` slices a fixed-size `[1]SIDAndAttributes`
+   array — any token with more than one group panicked the accept loop. The
+   members are now re-sliced with `unsafe.Slice` (`tokenGroupSIDs`).
+
 ## Why BLOCKED (not PASS)
 
-1. **Safe Start is not provable in PC-100 boundaries.** `Start` hands the
-   client-supplied `core_config` (full sing-box JSON), optional
-   `xray_config`/`xray_full_configs` (Xray JSON) and `tun_ipv4_cidr` to the
-   privileged runtime. That JSON can direct the SYSTEM-privileged core to
-   **write files** (sing-box `log.output`, `experimental.cache_file.path`;
+1. **Config-content policy — implemented in round 2, VM evidence outstanding.**
+   `Start` hands the client-supplied `core_config` (full sing-box JSON),
+   optional `xray_config`/`xray_full_configs` (Xray JSON) and `tun_ipv4_cidr`
+   to the privileged runtime. That JSON can direct the SYSTEM-privileged core
+   to **write files** (sing-box `log.output`, `experimental.cache_file.path`;
    Xray `log.access`/`log.error`) and **read files** (TLS
-   `certificate_path`/`key_path`, geoip/geosite paths). The extra-process
-   guard removes the direct execution surface, but a config-content policy
-   (deny/allowlist these fields, canonicalize paths) is required before a
-   service Start can be called safe. That is exactly ADR-001's "Service не
-   доверяет путям/JSON UI: canonicalization, validation и allowlisted
-   operations выполняются на privileged side" and belongs to the PC-110
-   typed contract. No unsafe temporary fallback was added: service-mode
-   Start stays prototype-only until that contract exists.
+   `certificate_path`/`key_path`, geoip/geosite paths). Round 2 closes this
+   surface in code: normalization + deny-by-default rejection of every
+   filesystem-bearing field, proven by a wire-level traversal matrix
+   (absolute, `..\` and junction cache paths land only in the service data
+   directory). What remains BLOCKED is the VM-side acceptance: SCM start/stop
+   with the policy active, and the non-elevated client procedure below.
 2. **SCM evidence missing** — no disposable Windows VM; `sc create/start/stop`
    and the non-elevated client procedure below have never been executed.
 3. SDDL/peer-SID behavior on a real VM (refusal of a non-elevated client
-   against the default DACL) is unverified.
+   against the default DACL) is unverified. The identity boundary itself
+   (client token resolution over a real pipe, admission policy, DACL-vs-token
+   interplay) is unit-tested in-process, including a real winio
+   listen/dial round trip with an own-SID DACL — but a non-elevated runner on
+   a VM is still required for the denial direction.
 
 ## Decision (ADR-002)
 
@@ -124,7 +211,7 @@ Windows SCM").
 | Incompatible client gets typed error | PASS | `TestServiceHandshakeVersionMismatchTypedError` (`ERR_PROTOCOL_VERSION`, disconnect) |
 | No GUI → no service crash | PASS | disconnect/reconnect keeps serving (Health OK after reconnect) |
 | Secrets/full config not in logs | PASS | `TestServiceModeNeverLogsConfigSecrets` (marker not logged even with THRONE_CORE_DEBUG=1; child-mode debug dump stays a documented upstream debt) |
-| Handshake/Health/CheckConfig/Start/Stop only | **BLOCKED** | Pre-remediation this row claimed PASS — that claim was **wrong**: the serve loop called the general `dispatch()` and exposed the whole legacy handlers table (review P0). Post-remediation the service path uses an explicit five-method allowlist with typed `ERR_METHOD_NOT_ALLOWED` for everything else; proven by wire-path tests. Full safe-Start proof still blocked by the config-content policy gap (see "Why BLOCKED") |
+| Handshake/Health/CheckConfig/Start/Stop only | **BLOCKED** | Pre-remediation this row claimed PASS — that claim was **wrong**: the serve loop called the general `dispatch()` and exposed the whole legacy handlers table (review P0). Post-remediation the service path uses an explicit five-method allowlist with typed `ERR_METHOD_NOT_ALLOWED` for everything else; proven by wire-path tests. The config-content policy gap (review P0 #2) is closed in code in round 2 — normalization + deny-by-default with a wire-level traversal matrix; full safe-Start proof on a VM is still outstanding |
 | Real SCM test | **BLOCKED** | requires disposable Windows VM + service registration; procedure below |
 
 ## Commands and results (post-remediation)
@@ -141,9 +228,31 @@ ThroneCore.exe service                             → refuses outside SCM (expe
 ThroneCore.exe bogus-mode                          → "unknown run mode" fatal (expected)
 ```
 
+Round 2 (config policy + identity boundary):
+
+```
+gofmt -l (changed files)                           → clean
+go vet (CI tags, root package)                     → exit 0
+go build (CI tags)                                 → exit 0
+go test -count=20 (24 PC-100 tests: 15 round-1 +
+  9 round-2, CI tags, -ldflags="-checklinkname=0") → ok  (24 × 20 runs)
+go test . ./internal/xray/ ./internal/xraydns/     → all ok (regression)
+git diff --check                                   → clean
+```
+
+Round 2 vet note: `go vet ./...` (any tags, with `-a`) has exactly one
+remaining finding — a pre-existing upstream `unreachable code` duplicate
+`return nil` at `internal/boxdns/dns_manager_windows.go:246` (pinned DNS
+machinery, outside the allowed edit surface). The winipcfg `%w`-in-`t.Errorf`
+vet debt (52 sites) was eliminated this round; beware that `go vet` caches
+results per build config — a cached pass can hide a fresh finding unless run
+with `-a`.
+
 Pre-remediation suite (10 tests) passed once; the external review then found
-the P0 dispatch-table exposure — fixed as described above, with the suite
-grown to 15 tests and re-verified at -count=20.
+the P0 dispatch-table exposure — fixed as described above. Round 2 added the
+config-policy and identity suites (9 tests, including the wire traversal
+matrix and a real named-pipe identity round trip) and re-verified everything
+at -count=20.
 
 ## Manual SCM procedure (VM only, BLOCKED here)
 
@@ -164,12 +273,18 @@ grown to 15 tests and re-verified at -count=20.
 
 ## Risks / follow-ups
 
-- **PC-110 typed contract must include a privileged-side config policy** for
-  Start (deny/allowlist `log.output`, `cache_file.path`, Xray log file paths,
-  TLS cert/key path handling; explicit TUN config policy) — without it a
-  service client could still direct the SYSTEM runtime to arbitrary file
-  writes/reads via the config JSON. This is the main reason PC-100 stays
-  BLOCKED.
+- **PC-110 typed contract supersedes the round-2 interim policy.** The
+  deny-by-default JSON policy closes the known filesystem surface of the
+  string-config contract, but it is still a string contract: PC-110 must
+  replace it with typed parameters (the service builds its own configuration
+  end-to-end) plus the versioned envelope, deadlines and formal limits. The
+  interim policy is deliberately conservative — unknown path-bearing fields
+  added upstream will surface as rejections until the deny list is revised
+  (fail-closed direction).
+- **Identity boundary scaling**: `THRONE_SERVICE_ALLOWED_SIDS` +
+  Administrators is the ADR-001 admission policy; per-user SID grants at the
+  DACL arrive with the installer (PC-120). VM evidence for the denial
+  direction (non-elevated client refused) is still the BLOCKED item.
 - **Upstream defect (recorded, not fixed here)**: `server.go` dereferences
   proto2 optional pointers directly (`:399`, `:434`, `:474`, `:579`); any RPC
   client omitting those fields crashes the handler (recovered, but the

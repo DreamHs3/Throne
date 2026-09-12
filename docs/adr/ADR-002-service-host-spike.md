@@ -108,3 +108,52 @@ PC-100 недоказуем — config JSON может направить privil
 TLS cert/key пути, Xray log пути); typed contract политики конфигурации —
 обязательная часть PC-110 (ADR-001: privileged side не доверяет путям/JSON
 UI). До него service-mode Start — prototype-only, статус PC-100 — BLOCKED.
+
+## Addendum №2 (PC-100 remediation round 2 — filesystem policy + identity boundary)
+
+Закрывает в коде главный оставшийся риск предыдущего аддендума (evidence на
+VM остаётся за BLOCKED). Два механизма, оба fail-closed:
+
+**Config filesystem policy** (`core/server/service_config_policy.go`, новый
+файл; единый контракт для `ServiceStart` и `ServiceCheckConfig` — «что
+принимает один, принимает другой»):
+
+- *Нормализация* (клиент не контролирует): `experimental.cache_file.path`
+  переписывается в `<THRONE_SERVICE_DATA_DIR>/cache.db`; включённый cache_file
+  без data dir — typed `ERR_CONFIG_POLICY` (fail-closed: рабочая директория
+  службы — System32); при выключенном cache_file клиентский path удаляется;
+  `clash_api.external_ui*` удаляются всегда.
+- *Deny-by-default*: каждое filesystem-bearing поле на любой глубине —
+  логи, TLS/OpenVPN/OpenConnect сертификаты и ключи (включая client/mTLS, CA,
+  MCA, CRL, static keys, wrapper scripts), SSH `private_key_path`,
+  локальные/удалённые rule-set пути, каталоги/бинарники tailscale/ACME/tor,
+  Xray `log.access`/`error` (только `none`/пусто) и Xray
+  `certificateFile`/`keyFile` — плюс литералы `unix://`, `\\.\pipe`, `\\.\`,
+  `\\?\` в любом поле. Список ключей построен перечислением всех
+  filesystem-bearing JSON-ключей в `option`-пакете закреплённого sing-box
+  (24 ключа сверх исходного списка ревью добавлены). Route-матчеры
+  `process_path`/`process_path_regex` и DERP `home` НЕ запрещены намеренно:
+  ядро не открывает эти значения как файлы, а per-app proxy Throne их
+  использует.
+- Решение осознанно interim: PC-110 заменяет string-контракт typed
+  параметрами; до тех пор неизвестные upstream path-поля всплывут как
+  отказ (fail-closed направление).
+
+**Windows identity boundary** (ADR-001) — DACL идентифицирует только группу;
+клиент авторизуется по токену процесса в момент accept, до handshake:
+`GetNamedPipeClientProcessId` → `OpenProcess` → `OpenProcessToken` →
+`TokenUser`/`TokenGroups` → политика допуска `serviceClientAllowed`
+(`THRONE_SERVICE_ALLOWED_SIDS` от инсталлятора PC-120 + Administrators
+`S-1-5-32-544`). Неразрешимая личность — отказ; в лог пишется только SID.
+`safeServiceSDDL` не даёт ослабить переопределение: обязателен `D:P`,
+запрещены trustee WD/AN/AU/BU, небезопасное переопределение валит старт
+listener'а (никакого тихого fallback). Ограничение (не баг): admin-процесс
+проходит по группе — это принятая модель ADR-001; ужесточение до
+explicit-разрешений — PC-110/120.
+
+Три дефекта round-1 кода найдены тестами этого раунда и исправлены: не
+срабатывавшая exemption `cache_file.path` (сравнение пути родителя с путём
+ребёнка), мёртвая проверка trustee в `sddlGrantsTrustee` (off-by-one после
+split по `(A;` + trustee — последнее поле ACE), и паника
+`Tokengroups.Groups[:GroupCount]` на любом реальном токене с >1 группой
+(фиксированный массив `[1]`; переписано через `unsafe.Slice`).
