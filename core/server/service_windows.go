@@ -104,13 +104,28 @@ func serviceSDDL() (string, error) {
 	return defaultServiceSDDL, nil
 }
 
+// broadSDDLTrusteeSIDs are the raw-SID spellings of the broad trustees the
+// guard already rejects by abbreviation. The trustee field is matched by the
+// security subsystem as a plain string, so D:P(A;;GA;;;S-1-1-0) names
+// Everyone exactly like D:P(A;;GA;;;WD) does — only the WD/AN/AU/BU literals
+// were checked before round 3.
+var broadSDDLTrusteeSIDs = map[string]string{
+	"S-1-1-0":      "Everyone",
+	"S-1-5-7":      "Anonymous",
+	"S-1-5-11":     "Authenticated Users",
+	"S-1-5-32-545": "Builtin Users",
+	"S-1-5-32-546": "Builtin Guests",
+}
+
 // safeServiceSDDL protects the SDDL override from unsafe substitution. A
 // usable DACL must be protected ("D:P" - inherited ACEs off) and must not
 // grant access to broad trustees: Everyone (WD), Anonymous (AN),
-// Authenticated Users (AU) or Builtin Users (BU). Per-user SID grants
-// ("A;;GA;;;S-1-5-21-...") and SYSTEM/ADMINISTRATORS remain fine. An unsafe
-// override fails the listener start - never a silent fallback to something
-// broader.
+// Authenticated Users (AU) or Builtin Users (BU) — by abbreviation or by raw
+// SID (Everyone S-1-1-0, Anonymous S-1-5-7, Authenticated Users S-1-5-11,
+// Builtin Users S-1-5-32-545, Builtin Guests S-1-5-32-546). Per-user SID
+// grants ("A;;GA;;;S-1-5-21-...") and SYSTEM/ADMINISTRATORS remain fine. An
+// unsafe override fails the listener start - never a silent fallback to
+// something broader.
 func safeServiceSDDL(sddl string) (string, error) {
 	if !strings.HasPrefix(sddl, "D:P") {
 		return "", fmt.Errorf("%s: service SDDL must start with a protected DACL (D:P)", errInvalidRequest)
@@ -120,18 +135,35 @@ func safeServiceSDDL(sddl string) (string, error) {
 			return "", fmt.Errorf("%s: service SDDL must not grant access to %s", errInvalidRequest, trustee)
 		}
 	}
+	for _, trustee := range sddlACETrustees(sddl) {
+		if label, broad := broadSDDLTrusteeSIDs[trustee]; broad {
+			return "", fmt.Errorf("%s: service SDDL must not grant access to %s (raw SID %s)", errInvalidRequest, label, trustee)
+		}
+	}
 	return sddl, nil
 }
 
-// sddlGrantsTrustee reports whether any allow ACE in the SDDL string grants
-// access to the given trustee abbreviation. An ACE body is
-// type;flags;rights;objectGUID;inheritGUID;trustee — the "(A;" split consumes
-// the type and its delimiter, so the trustee is the last remaining field.
-// Deliberately simple: exact match on the trustee field of each allow ACE.
-func sddlGrantsTrustee(sddl string, trustee string) bool {
+// sddlACETrustees returns the trustee field of every allow ACE in the SDDL
+// string. An ACE body is type;flags;rights;objectGUID;inheritGUID;trustee —
+// the "(A;" split consumes the type and its delimiter, so the trustee is the
+// last remaining field.
+func sddlACETrustees(sddl string) []string {
+	var trustees []string
 	for _, ace := range strings.Split(sddl, "(A;") {
 		fields := strings.Split(strings.TrimSuffix(ace, ")"), ";")
-		if len(fields) > 0 && fields[len(fields)-1] == trustee {
+		if len(fields) > 0 {
+			trustees = append(trustees, fields[len(fields)-1])
+		}
+	}
+	return trustees
+}
+
+// sddlGrantsTrustee reports whether any allow ACE in the SDDL string grants
+// access to the given trustee abbreviation. Deliberately simple: exact match
+// on the trustee field of each allow ACE.
+func sddlGrantsTrustee(sddl string, trustee string) bool {
+	for _, t := range sddlACETrustees(sddl) {
+		if t == trustee {
 			return true
 		}
 	}

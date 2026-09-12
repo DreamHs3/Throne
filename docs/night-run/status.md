@@ -102,7 +102,8 @@ Branch: `agent/night-stage1-service-spike`, start HEAD `041b0978`
 (`fix(PC-100): restrict privileged service RPC surface`). Continuation of the
 interrupted round per `docs/night-run/handoff-2026-09-12.md`.
 
-- [PC-100] New `core/server/service_windows_policy_windows_test.go` (9 tests):
+- [PC-100] New `core/server/service_windows_policy_windows_test.go` (10 tests —
+  the "9" written at the time was an undercount, corrected in round 3):
   rejection matrix over **every** deny key + IPC/device value prefixes (41
   cases), disabled-cache_file path drop, passthrough boundaries, normalization
   (`THRONE_SERVICE_DATA_DIR`), fail-closed without data dir, Xray document
@@ -128,7 +129,7 @@ interrupted round per `docs/night-run/handoff-2026-09-12.md`.
   WD/AN/AU/BU ban was dead code; (3) `clientTokenIdentity` panicked on any
   token with >1 group (`Groups[:GroupCount]` on a fixed `[1]` array) — fixed
   via `unsafe.Slice` (`tokenGroupSIDs`).
-- [PC-100] Suite: `go test -count=20` — 24 tests × 20 runs ok; regression
+- [PC-100] Suite: `go test -count=20` — 25 tests × 20 runs ok; regression
   `.` + `internal/xray` + `internal/xraydns` ok; gofmt/vet/build (CI tags)
   clean; `git diff --check` clean.
 - [PC-100] Status: **still BLOCKED** (SCM start/stop, non-elevated client
@@ -172,3 +173,63 @@ interrupted round per `docs/night-run/handoff-2026-09-12.md`.
 - [round] Final check: 4 commits `fix(PC-100)` / `fix(PC-010)` / `fix(PC-020)`
   / `fix(tests)`; PC-100 remains BLOCKED until VM runs; no push/PR/tag; no
   service installed; winipcfg network tests not executed on this machine.
+
+## Remediation round 3 — 2026-09-12 (PC-100 parser semantics; honest Gate 0 note)
+
+Branch: `agent/night-stage1-service-spike`, start HEAD `f616e909`
+(`fix(tests): make winipcfg tests vet-clean`). Basis: an independent
+read-only review of the round-2 run found the config-filesystem policy
+bypassed end-to-end (P0) — proven by execution on this machine, not theory.
+
+- [PC-100] Review verdict on round 2: serviceMethodAllowlist, identity
+  boundary and the PC-010/PC-020 remediations are fine; the deny-list content
+  is correct (re-enumerated against the pinned sing-box `option` package).
+  But the policy parsed with std `encoding/json` while the privileged
+  runtimes parse with different semantics: JSONC comments passed the policy
+  unscanned (sing `contextjson` strips comments; Xray serial loader is
+  documented permissive), and case-variant keys (`LOG.OUTPUT`, `KEYFILE`)
+  passed exact map lookups while the runtime binds case-insensitively. A
+  JSONC config with a `log.output` sink was ACCEPTED by a real ServiceStart
+  and the privileged runtime created the file.
+- [PC-100] Fix (`core/server/service_config_policy.go`): fail-closed parsing
+  (anything the strict std parser cannot read → typed `ERR_CONFIG_POLICY` in
+  both entry points, instead of pass-through), case-folded key matching
+  (deny scan, Xray access/error sinks, normalization/exemption — every
+  case-variant of an owned key is deleted before the service-owned value is
+  written), case-insensitive value prefixes (+ bare gRPC `unix:` form), and
+  exact number preservation via `json.Decoder.UseNumber()`
+  (scan-what-you-run kept).
+- [PC-100] Parity (review P2): `ServiceCheckConfig` now validates
+  `xray_full_configs` like `ServiceStart` always did.
+- [PC-100] SDDL guard (review P2): raw-SID trustees of broad groups
+  (Everyone `S-1-1-0`, Anonymous `S-1-5-7`, Authenticated Users `S-1-5-11`,
+  Builtin Users `S-1-5-32-545`, Builtin Guests `S-1-5-32-546`) now refused
+  at listener start exactly like the WD/AN/AU/BU abbreviations.
+- [PC-100] Tests: 7 new round-3 tests (fail-closed strict-JSON matrix for
+  both entry points; wire JSONC rejection for Start AND CheckConfig with the
+  sink file never created; case-variant deny keys direct + over the wire;
+  case-variant `EXPERIMENTAL.CACHE_FILE` normalization incl. duplicate
+  case-variant blocks and the no-data-dir fail-closed direction; number
+  fidelity; `xray_full_configs` parity; SDDL raw-SID refusal at the
+  listener). Suite: `go test -count=20` — 32 tests × 20 runs ok; regression
+  `.` + `internal/xray` + `internal/xraydns` ok; gofmt clean; build exit 0;
+  `go vet -a` → exactly the one pre-existing finding
+  (`internal/boxdns/dns_manager_windows.go:246` unreachable code);
+  `git diff --check` clean.
+- [PC-100] Status: **still BLOCKED** — the round-3 fix is code-level only
+  (green tests ≠ VM evidence): SCM start/stop, non-elevated client refusal
+  and SDDL-refusal under a normal user remain VM-only. Gate 1 NOT closed.
+- [round] **Honest note (review P2, recorded, not fixed):** the transition
+  to PC-100 was made while Gate 0 was formally still open —
+  `final-report.md` §13 explicitly said "не начинать" until the VM baseline
+  run, the C++ test run and the PC-010/020 diff review were done. The spike
+  work proceeded anyway (owner's decision chain); **Gate 0 is NOT declared
+  closed by this round** — the three §13 items above are still outstanding,
+  and PC-100's own VM acceptance is the follow-up evidence package.
+- [round] Bookkeeping correction: round 2 actually added 10 tests (25
+  total), not 9/24 as written at the time; corrected above and in
+  pc-100-report.md.
+- [round] `core/server/gen/libcore.proto` remains the owner's PC-110 WIP:
+  not committed, still `M` in the working tree; all commits use explicit
+  `git add <files>`, proto verified absent from each commit via
+  `git log --name-only`.

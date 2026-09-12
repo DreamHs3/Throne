@@ -10,7 +10,7 @@
 // installation, no network; the only named pipe created is the test pipe.
 // Round 3 adds the parser-semantics suite: the strict-JSON fail-closed gate
 // (JSONC), case-folded deny keys / normalization / value prefixes, number
-// fidelity, and xray_full_configs parity.
+// fidelity, xray_full_configs parity, and raw-SID SDDL trustees.
 
 package main
 
@@ -402,14 +402,20 @@ func TestServiceSDDLValidation(t *testing.T) {
 		}
 	}
 	unsafe := []string{
-		"D:P(A;;GA;;;WD)",             // Everyone
-		"D:P(A;;GA;;;AN)",             // Anonymous
-		"D:P(A;;GA;;;AU)",             // Authenticated Users
-		"D:P(A;;GA;;;BU)",             // Builtin Users
-		"D:P(A;;GA;;;SY)(A;;GA;;;WD)", // broad trustee behind a valid prefix
-		"D:(A;;GA;;;SY)",              // DACL without the protected flag
-		"O:SYD:P(A;;GA;;;SY)",         // owner section first, not a bare protected DACL
-		"",                            // no DACL at all
+		"D:P(A;;GA;;;WD)",                       // Everyone
+		"D:P(A;;GA;;;AN)",                       // Anonymous
+		"D:P(A;;GA;;;AU)",                       // Authenticated Users
+		"D:P(A;;GA;;;BU)",                       // Builtin Users
+		"D:P(A;;GA;;;S-1-1-0)",                  // Everyone as a raw SID
+		"D:P(A;;GA;;;S-1-5-7)",                  // Anonymous as a raw SID
+		"D:P(A;;GA;;;S-1-5-11)",                 // Authenticated Users as a raw SID
+		"D:P(A;;GA;;;S-1-5-32-545)",             // Builtin Users as a raw SID
+		"D:P(A;;GA;;;S-1-5-32-546)",             // Builtin Guests as a raw SID
+		"D:P(A;;GA;;;SY)(A;;GA;;;WD)",           // broad trustee behind a valid prefix
+		"D:P(A;;GA;;;SY)(A;;GA;;;S-1-5-32-545)", // broad raw SID behind a valid prefix
+		"D:(A;;GA;;;SY)",                        // DACL without the protected flag
+		"O:SYD:P(A;;GA;;;SY)",                   // owner section first, not a bare protected DACL
+		"",                                      // no DACL at all
 	}
 	for _, sddl := range unsafe {
 		if _, err := safeServiceSDDL(sddl); err == nil || !strings.HasPrefix(err.Error(), errInvalidRequest) {
@@ -836,5 +842,26 @@ func TestServiceWireXrayFullConfigsParity(t *testing.T) {
 	}
 	if currentBox() != nil {
 		t.Fatal("parity rejections must not have started a runtime")
+	}
+}
+
+// The guard is enforced at listener start: a raw-SID trustee in the
+// admin-controlled override fails the listen exactly like its abbreviation,
+// so no pipe with a broad DACL is ever created.
+func TestServiceSDDLRawSidTrusteeRefusedAtListenerStart(t *testing.T) {
+	for _, sddl := range []string{
+		"D:P(A;;GA;;;S-1-1-0)",             // Everyone as a raw SID
+		"D:P(A;;GA;;;S-1-5-32-545)",        // Builtin Users as a raw SID
+		"D:P(A;;GA;;;S-1-5-11)",            // Authenticated Users as a raw SID
+		"D:P(A;;GA;;;SY)(A;;GA;;;S-1-1-0)", // behind a valid prefix
+	} {
+		t.Setenv("THRONE_SERVICE_PIPE", `\\.\pipe\ProxyCoreServiceTest-SddlGuard`)
+		t.Setenv("THRONE_SERVICE_SDDL", sddl)
+		_, err := listenServicePipe()
+		if err == nil {
+			t.Errorf("listenServicePipe must refuse %q", sddl)
+		} else if !strings.HasPrefix(err.Error(), errInvalidRequest) {
+			t.Errorf("refusing %q must be the typed invalid-request error, got %v", sddl, err)
+		}
 	}
 }
