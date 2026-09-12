@@ -71,3 +71,27 @@ Session date: 2026-09-12 (night), autonomous run.
 - [PC-030] UI link seam: `tests/proxycore/test_stubs.cpp` provides the three MainWindow members referenced from the core (profile_stop/UpdateDataView/setDownloadReport); no production code changed for tests.
 - [PC-030] Not covered yet (documented follow-up): full BuildSingBoxConfig goldens (DNS/TUN sections) — need the PC-310 BuildInputs seam or a full profile environment; real core start/stop RPC lifecycle — parentcheck requires the GUI parent executable, impossible in a test harness without the PC-100 service boundary. Marked in final report, not silently skipped.
 - [PC-000] → see sections below (appended as work progresses).
+
+## Branch rename + Stage 0 → service spike transition gate (2026-09-12)
+
+- Branch renamed per task addendum: `agent/night-foundation-2026-09-12` →
+  `agent/night-stage0-foundation` (same commits, no history rewrite). Earlier
+  references in these docs use the original name recorded at creation time.
+- Transition conditions checked (all 10):
+  1. PC-000/010/020/030 implemented and committed — YES.
+  2. Each package in its own commit — YES.
+  3. Available build/tests pass — YES (ThroneCore build exit 0; go test 3
+     packages ok; PC-020 guard ok). C++ test targets are written but not
+     executable here (no toolchain) — documented BLOCKED, they are not among
+     the "available" checks in this environment.
+  4. Working tree clean — YES.
+  5. No critical baseline error found — YES (Go baseline builds and passes;
+     GUI baseline unbuilt = BLOCKED, not an error).
+  6. Distinct data/instance identifiers — YES (PC-010).
+  7. Upstream updater disabled — YES (PC-020 + guard).
+  8. Characterization tests capture current behavior — YES (written; execution
+     BLOCKED documented).
+  9. Final Stage 0 report — YES (docs/night-run/final-report.md).
+  10. VM-only tests listed separately — YES (final-report §9).
+- Decision: transition to the service spike branch is ALLOWED; VM-bound items
+  stay BLOCKED and are carried into the spike base notes.
