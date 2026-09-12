@@ -138,6 +138,18 @@ func main() {
 	runtimeDebug.SetMemoryLimit(memoryLimit)
 	go watchMemory()
 
-	RunCore()
+	// PC-100: no arguments = the legacy GUI-parent child mode, exactly as
+	// before. "service" = the Windows service-capable mode (service_windows.go).
+	// Anything else is rejected so a typo can never silently pick a mode.
+	switch runModeFromArgs(os.Args[1:]) {
+	case runModeLegacy:
+		RunCore()
+	case runModeService:
+		if err := runServiceMode(); err != nil {
+			log.Fatalf("service mode failed: %v", err)
+		}
+	default:
+		log.Fatalf("unknown run mode; expected no arguments (GUI child mode) or \"service\"")
+	}
 	return
 }

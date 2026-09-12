@@ -46,6 +46,24 @@ message ErrorResp {
   optional string error = 1 [default = ""];
 }
 
+// PC-100 service-spike additions (additive only; PC-110 replaces this with
+// the versioned envelope). Messages are NOT part of the LibcoreService
+// service block so the generated server interface stays unchanged.
+
+message HandshakeReq {
+  optional int32 protocol_version = 1 [default = 0];
+}
+
+message HandshakeResp {
+  optional int32 protocol_version = 1 [default = 0];
+  optional string service_version = 2 [default = ""];
+}
+
+message HealthResp {
+  optional bool runtime_running = 1 [default = false];
+  optional int32 protocol_version = 2 [default = 0];
+}
+
 message LoadConfigReq {
   optional string core_config = 1 [default = ""];
   optional bool disable_stats = 2 [default = false];
