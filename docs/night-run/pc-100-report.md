@@ -1,9 +1,75 @@
 # PC-100 report — prototype service-capable core runtime
 
-Commit: see `git log` (PC-100: prototype service-capable core runtime).
-Branch: `agent/night-stage1-service-spike`. Status: **PASS (spike scope)**
-with SCM acceptance **BLOCKED** (no disposable Windows VM — by rule, not by
-limitation of the code).
+Commit: see `git log` (PC-100: prototype service-capable core runtime; plus
+the remediation commit `fix(PC-100): restrict privileged service RPC surface`).
+Branch: `agent/night-stage1-service-spike`. Status: **BLOCKED** — the spike
+code is implemented and all available unit/build checks pass, but the roadmap
+acceptance (SCM start/stop, non-elevated Windows-VM client evidence) has not
+been executed, and a **safe Start cannot be proven within PC-100 boundaries**
+(see "Why BLOCKED" below). BLOCKED is not PASS; **Gate 1 is NOT closed**.
+
+## Remediation (external review, this commit)
+
+P0 confirmed and fixed: before the remediation, after the Hello handshake the
+service serve loop called the **general `dispatch()`**, which exposed the
+whole legacy handlers table to a service client — including SetSystemDNS,
+InstallDashboard, CloseConnections and Start with an arbitrary
+`extra_process_path`/`extra_process_args`/`extra_process_conf`. After a
+per-user SID grant (PC-110/120) that would have allowed code execution and
+file operations from SYSTEM. The earlier claim in this report that the wire
+path already provided "only" the five spike methods was **wrong** and has been
+removed.
+
+Fix (`core/server/service_windows.go`):
+- `serviceMethodAllowlist` — the service serve loop now resolves methods ONLY
+  through an explicit five-method allowlist (Hello, Health, CheckConfig,
+  Start, Stop). Everything else — known to the legacy table or not — gets the
+  stable typed error `ERR_METHOD_NOT_ALLOWED`. No fallback to the legacy
+  `handlers` map; the legacy map itself is untouched (GUI child mode keeps
+  full behavior).
+- `ServiceStart` guard — rejects `need_extra_process=true` and any non-empty
+  `extra_process_path` / `extra_process_args` / `extra_process_conf` (and
+  `extra_no_out`) with the typed `ERR_INVALID_REQUEST` error **before** any
+  parsing or spawning; also rejects `need_xray=true` without `xray_config`.
+- `normalizeLoadConfigReq` — upstream `server.go` dereferences proto2
+  optional pointers directly (`server.go:399` `*in.NeedExtraProcess`, `:434`
+  `*in.NeedXray`, `:474` `*in.CoreConfig`, `:579` `*in.CoreConfig`), so a
+  request that omits fields would crash a handler (recovered upstream, but
+  the request can never succeed). The GUI always sends every field; the
+  service path now normalizes absent fields to their defaults instead. This
+  is recorded as an **upstream robustness defect** and deliberately NOT
+  patched in server.go (PC-100 boundary; belongs in the PC-110 typed
+  contract / an upstreamable patch).
+- Panic recover now logs the full stack (parity with `runDispatch`).
+- New wire-path tests (all through `serveServiceConn` with real framing after
+  Hello, never via direct `dispatch()` calls): allowed methods and the full
+  safe Start→Health→Stop lifecycle; rejection of SetSystemDNS /
+  InstallDashboard / CloseConnections / QueryStats / GenWgKeyPair / unknown
+  methods with the connection staying usable; rejection of every
+  extra-process field combination; omitted-field normalization; allowlist vs
+  legacy table structure. Full suite: `go test -count=20` → **ok** (15 tests
+  × 20 runs).
+
+## Why BLOCKED (not PASS)
+
+1. **Safe Start is not provable in PC-100 boundaries.** `Start` hands the
+   client-supplied `core_config` (full sing-box JSON), optional
+   `xray_config`/`xray_full_configs` (Xray JSON) and `tun_ipv4_cidr` to the
+   privileged runtime. That JSON can direct the SYSTEM-privileged core to
+   **write files** (sing-box `log.output`, `experimental.cache_file.path`;
+   Xray `log.access`/`log.error`) and **read files** (TLS
+   `certificate_path`/`key_path`, geoip/geosite paths). The extra-process
+   guard removes the direct execution surface, but a config-content policy
+   (deny/allowlist these fields, canonicalize paths) is required before a
+   service Start can be called safe. That is exactly ADR-001's "Service не
+   доверяет путям/JSON UI: canonicalization, validation и allowlisted
+   operations выполняются на privileged side" and belongs to the PC-110
+   typed contract. No unsafe temporary fallback was added: service-mode
+   Start stays prototype-only until that contract exists.
+2. **SCM evidence missing** — no disposable Windows VM; `sc create/start/stop`
+   and the non-elevated client procedure below have never been executed.
+3. SDDL/peer-SID behavior on a real VM (refusal of a non-elevated client
+   against the default DACL) is unverified.
 
 ## Decision (ADR-002)
 
@@ -58,18 +124,26 @@ Windows SCM").
 | Incompatible client gets typed error | PASS | `TestServiceHandshakeVersionMismatchTypedError` (`ERR_PROTOCOL_VERSION`, disconnect) |
 | No GUI → no service crash | PASS | disconnect/reconnect keeps serving (Health OK after reconnect) |
 | Secrets/full config not in logs | PASS | `TestServiceModeNeverLogsConfigSecrets` (marker not logged even with THRONE_CORE_DEBUG=1; child-mode debug dump stays a documented upstream debt) |
-| Handshake/Health/CheckConfig/Start/Stop only | PASS | service path gates on Hello; no policy mutation, no WFP, no command execution (none exist in the wire path) |
+| Handshake/Health/CheckConfig/Start/Stop only | **BLOCKED** | Pre-remediation this row claimed PASS — that claim was **wrong**: the serve loop called the general `dispatch()` and exposed the whole legacy handlers table (review P0). Post-remediation the service path uses an explicit five-method allowlist with typed `ERR_METHOD_NOT_ALLOWED` for everything else; proven by wire-path tests. Full safe-Start proof still blocked by the config-content policy gap (see "Why BLOCKED") |
 | Real SCM test | **BLOCKED** | requires disposable Windows VM + service registration; procedure below |
 
-## Commands and results
+## Commands and results (post-remediation)
 
 ```
-go build (CI tags)                 → exit 0
-go test -run <PC-100 tests> -v .   → 10/10 PASS (0.19s)
-go test . ./internal/xray/ ./internal/xraydns/ → all ok
-ThroneCore.exe service             → refuses outside SCM (expected)
-ThroneCore.exe bogus-mode          → "unknown run mode" fatal (expected)
+gofmt -l -w (changed files)                        → clean
+go vet (project build tags, root package)          → exit 0
+go build (CI tags)                                 → exit 0
+go test -count=20 (15 PC-100 tests, CI tags,
+  -ldflags="-checklinkname=0")                     → ok  (15 × 20 runs)
+go test . ./internal/xray/ ./internal/xraydns/     → all ok (regression)
+git diff --check                                   → clean
+ThroneCore.exe service                             → refuses outside SCM (expected)
+ThroneCore.exe bogus-mode                          → "unknown run mode" fatal (expected)
 ```
+
+Pre-remediation suite (10 tests) passed once; the external review then found
+the P0 dispatch-table exposure — fixed as described above, with the suite
+grown to 15 tests and re-verified at -count=20.
 
 ## Manual SCM procedure (VM only, BLOCKED here)
 
@@ -90,6 +164,17 @@ ThroneCore.exe bogus-mode          → "unknown run mode" fatal (expected)
 
 ## Risks / follow-ups
 
+- **PC-110 typed contract must include a privileged-side config policy** for
+  Start (deny/allowlist `log.output`, `cache_file.path`, Xray log file paths,
+  TLS cert/key path handling; explicit TUN config policy) — without it a
+  service client could still direct the SYSTEM runtime to arbitrary file
+  writes/reads via the config JSON. This is the main reason PC-100 stays
+  BLOCKED.
+- **Upstream defect (recorded, not fixed here)**: `server.go` dereferences
+  proto2 optional pointers directly (`:399`, `:434`, `:474`, `:579`); any RPC
+  client omitting those fields crashes the handler (recovered, but the
+  request can never succeed). The GUI always sends every field. Candidates
+  for an upstreamable one-line getter patch outside PC-100 scope.
 - SDDL default (SYSTEM+Administrators) intentionally excludes the normal user
   until PC-110/PC-120 define per-user SID grants — the UI cannot talk to the
   service yet; that is the next package's contract, not a gap in this spike.

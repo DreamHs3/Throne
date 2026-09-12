@@ -91,3 +91,20 @@ service mode игнорирует `THRONE_CORE_DEBUG` (raw config никогда
 существующие typed RPC-методы (Health/Hello/CheckConfig/Start/Stop); никаких
 путей к исполняемым файлам, shell-команд и raw privileged операций служба не
 принимает.
+
+## Addendum (PC-100 remediation, external review P0)
+
+Первоначальная реализация после handshake вызывала общий `dispatch()` —
+service-клиент получал доступ ко всей legacy таблице handlers
+(SetSystemDNS, InstallDashboard, Start с произвольным extra_process_path).
+Исправлено: service serve loop резолвит методы ТОЛЬКО через явный
+пятиметодный allowlist (`serviceMethodAllowlist`), всё остальное получает
+стабильную typed ошибку `ERR_METHOD_NOT_ALLOWED`; legacy dispatch и
+parentcheck не изменены; SDDL не ослаблен. `ServiceStart` дополнительно
+отклоняет все extra-process поля (typed `ERR_INVALID_REQUEST`) до какого-либо
+парсинга/запуска. Оставшийся риск зафиксирован: безопасный Start в границах
+PC-100 недоказуем — config JSON может направить privileged runtime на
+запись/чтение произвольных путей (sing-box `log.output`/`cache_file.path`,
+TLS cert/key пути, Xray log пути); typed contract политики конфигурации —
+обязательная часть PC-110 (ADR-001: privileged side не доверяет путям/JSON
+UI). До него service-mode Start — prototype-only, статус PC-100 — BLOCKED.

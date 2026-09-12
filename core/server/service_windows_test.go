@@ -74,6 +74,15 @@ func handshakePayload(t *testing.T, version int32) []byte {
 	return b
 }
 
+func mustMarshal(t *testing.T, msg proto.Message) []byte {
+	t.Helper()
+	b, err := proto.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
 // ---- run mode entry point ----
 
 func TestRunModeFromArgs(t *testing.T) {
@@ -283,6 +292,253 @@ func TestStartInvalidConfigFailsClean(t *testing.T) {
 	}
 	if currentBox() != nil {
 		t.Fatal("a failed start must not leave a runtime behind")
+	}
+}
+
+// ---- service method allowlist (remediation of the PC-100 review P0) ----
+//
+// All assertions below go through serveServiceConn with real wire framing —
+// after a completed Hello handshake, exactly as a service client would —
+// never through a direct dispatch() call.
+
+func wireCall(t *testing.T, conn net.Conn, id uint32, method string, payload []byte) (uint8, []byte) {
+	t.Helper()
+	writeRequest(t, conn, id, method, payload)
+	gotID, status, data := readResponse(t, conn)
+	if gotID != id {
+		t.Fatalf("%s: response id = %d, want %d", method, gotID, id)
+	}
+	return status, data
+}
+
+func mustHandshake(t *testing.T, conn net.Conn) {
+	t.Helper()
+	if status, data := doHandshake(t, conn, serviceProtocolVersion); status != 0 {
+		t.Fatalf("handshake failed: status=%d data=%q", status, string(data))
+	}
+}
+
+// Privileged utility RPC that the legacy table carries must be unreachable
+// from the service wire path and must fail with the stable typed error, and
+// the connection must stay usable afterwards.
+func TestServiceWirePathRejectsPrivilegedMethods(t *testing.T) {
+	conn, _ := serveOverPipe(t)
+	mustHandshake(t, conn)
+
+	for _, method := range []string{"SetSystemDNS", "InstallDashboard", "CloseConnections", "QueryStats", "GenWgKeyPair", "DefinitelyNotAMethod"} {
+		status, data := wireCall(t, conn, 10, method, nil)
+		if status != 1 {
+			t.Fatalf("%s: want rejection status=1, got %d", method, status)
+		}
+		if !strings.HasPrefix(string(data), errMethodNotAllowed) {
+			t.Fatalf("%s: want %s typed error, got %q", method, errMethodNotAllowed, string(data))
+		}
+	}
+
+	// The rejection is stable and non-destructive: the same connection still
+	// serves allowlisted methods afterwards.
+	status, _ := wireCall(t, conn, 11, "Health", nil)
+	if status != 0 {
+		t.Fatalf("Health after rejections must succeed, got status=%d", status)
+	}
+	if currentBox() != nil {
+		t.Fatal("rejections must not have started a runtime")
+	}
+}
+
+// The service-mode Start must refuse the whole extra-process execution
+// surface (arbitrary executable path, args, config file) with the typed
+// invalid-request error, before anything is parsed or spawned.
+func TestServiceWireStartRejectsExtraProcess(t *testing.T) {
+	conn, _ := serveOverPipe(t)
+	mustHandshake(t, conn)
+
+	cases := []struct {
+		name string
+		req  *gen.LoadConfigReq
+	}{
+		{
+			name: "need_extra_process with arbitrary exe",
+			req: &gen.LoadConfigReq{
+				NeedExtraProcess: proto.Bool(true),
+				ExtraProcessPath: proto.String(`C:\Windows\System32\cmd.exe`),
+				ExtraProcessArgs: proto.String("/c del C:\\Users\\public\\x.txt"),
+				ExtraProcessConf: proto.String(`C:\temp\extra.conf`),
+			},
+		},
+		{
+			name: "path only, flag omitted",
+			req:  &gen.LoadConfigReq{ExtraProcessPath: proto.String(`C:\Windows\System32\cmd.exe`)},
+		},
+		{
+			name: "args only",
+			req:  &gen.LoadConfigReq{ExtraProcessArgs: proto.String("anything")},
+		},
+		{
+			name: "conf only",
+			req:  &gen.LoadConfigReq{ExtraProcessConf: proto.String(`C:\temp\extra.conf`)},
+		},
+	}
+	for i, c := range cases {
+		status, data := wireCall(t, conn, uint32(20+i), "Start", mustMarshal(t, c.req))
+		if status != 1 {
+			t.Fatalf("%s: want rejection status=1, got %d", c.name, status)
+		}
+		if !strings.HasPrefix(string(data), errInvalidRequest) || !strings.Contains(string(data), "not permitted in service mode") {
+			t.Fatalf("%s: want %s typed error, got %q", c.name, errInvalidRequest, string(data))
+		}
+		if currentBox() != nil {
+			t.Fatalf("%s: rejection must not start a runtime", c.name)
+		}
+	}
+
+	// Stop still works on the same connection; nothing was spawned or torn down.
+	status, data := wireCall(t, conn, 30, "Stop", mustMarshal(t, &gen.EmptyReq{}))
+	if status != 0 {
+		t.Fatalf("Stop after rejections must be a clean no-op, got status=%d data=%q", status, string(data))
+	}
+}
+
+// Allowed methods over the wire: Health, CheckConfig and the full safe
+// Start → Health(running) → Stop → Stop → Health(not running) lifecycle.
+// The config opens no inbounds/outbounds/TUN/DNS — nothing touches the
+// network or the filesystem beyond the core's own in-memory state.
+func TestServiceWireAllowedMethodsAndLifecycle(t *testing.T) {
+	conn, _ := serveOverPipe(t)
+	mustHandshake(t, conn)
+
+	status, data := wireCall(t, conn, 40, "CheckConfig", mustMarshal(t, &gen.LoadConfigReq{
+		CoreConfig: proto.String("{ definitely not json }"),
+	}))
+	if status != 0 {
+		t.Fatalf("CheckConfig must be reachable over the service wire path, got status=%d data=%q", status, string(data))
+	}
+	resp := &gen.ErrorResp{}
+	if err := proto.Unmarshal(data, resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.GetError() == "" {
+		t.Fatal("CheckConfig must report an error for a malformed config")
+	}
+
+	cfg := `{"log":{"level":"warn"},"inbounds":[],"outbounds":[]}`
+	status, data = wireCall(t, conn, 41, "Start", mustMarshal(t, &gen.LoadConfigReq{CoreConfig: proto.String(cfg)}))
+	if status != 0 {
+		t.Fatalf("safe Start must be accepted, got status=%d data=%q", status, string(data))
+	}
+	startResp := &gen.ErrorResp{}
+	if err := proto.Unmarshal(data, startResp); err != nil {
+		t.Fatal(err)
+	}
+	if startResp.GetError() != "" {
+		t.Fatalf("safe Start failed: %s", startResp.GetError())
+	}
+
+	status, data = wireCall(t, conn, 42, "Health", nil)
+	if status != 0 {
+		t.Fatalf("Health while running failed: status=%d", status)
+	}
+	health := &gen.HealthResp{}
+	if err := proto.Unmarshal(data, health); err != nil {
+		t.Fatal(err)
+	}
+	if !health.GetRuntimeRunning() {
+		t.Fatal("Health must report the running runtime")
+	}
+
+	for i := uint32(43); i <= 44; i++ {
+		status, data = wireCall(t, conn, i, "Stop", mustMarshal(t, &gen.EmptyReq{}))
+		if status != 0 {
+			t.Fatalf("Stop #%d failed: status=%d data=%q", i-42, status, string(data))
+		}
+	}
+	status, data = wireCall(t, conn, 45, "Health", nil)
+	if status != 0 {
+		t.Fatalf("Health after stop failed: status=%d", status)
+	}
+	if err := proto.Unmarshal(data, health); err != nil {
+		t.Fatal(err)
+	}
+	if health.GetRuntimeRunning() {
+		t.Fatal("runtime must be gone after Stop")
+	}
+}
+
+// Upstream server.go dereferences proto2 optional pointers directly
+// (server.go:399/434/474/579), so a request that omits fields would crash a
+// handler. The service path normalizes absent fields instead — an omitted
+// core_config must yield a clean typed error, never a panic, and the
+// connection must stay usable.
+func TestServiceWireOmittedFieldsAreNormalized(t *testing.T) {
+	conn, _ := serveOverPipe(t)
+	mustHandshake(t, conn)
+
+	// CheckConfig with no fields at all: upstream reports config errors
+	// INSIDE ErrorResp (status=0); the contract here is "clean error, no panic".
+	status, data := wireCall(t, conn, 50, "CheckConfig", nil)
+	if status != 0 {
+		t.Fatalf("CheckConfig with an empty request must answer with a response, got status=%d data=%q", status, string(data))
+	}
+	checkResp := &gen.ErrorResp{}
+	if err := proto.Unmarshal(data, checkResp); err != nil {
+		t.Fatal(err)
+	}
+	if checkResp.GetError() == "" || strings.Contains(checkResp.GetError(), "core panic") {
+		t.Fatalf("CheckConfig must return a clean config error, got %q", checkResp.GetError())
+	}
+
+	// Start with no fields at all: same response contract, no runtime left.
+	status, data = wireCall(t, conn, 51, "Start", nil)
+	if status != 0 {
+		t.Fatalf("Start with an empty request must answer with a response, got status=%d data=%q", status, string(data))
+	}
+	startEmpty := &gen.ErrorResp{}
+	if err := proto.Unmarshal(data, startEmpty); err != nil {
+		t.Fatal(err)
+	}
+	if startEmpty.GetError() == "" || strings.Contains(startEmpty.GetError(), "core panic") {
+		t.Fatalf("Start must return a clean config error for an empty request, got %q", startEmpty.GetError())
+	}
+	if currentBox() != nil {
+		t.Fatal("a failed field-less Start must not leave a runtime behind")
+	}
+
+	// need_xray without xray_config is a typed invalid request, not a panic.
+	status, data = wireCall(t, conn, 52, "Start", mustMarshal(t, &gen.LoadConfigReq{
+		NeedXray:   proto.Bool(true),
+		CoreConfig: proto.String(`{"inbounds":[],"outbounds":[]}`),
+	}))
+	if status != 1 || !strings.HasPrefix(string(data), errInvalidRequest) {
+		t.Fatalf("want %s for need_xray without xray_config, got status=%d data=%q", errInvalidRequest, status, string(data))
+	}
+
+	// Still serving after all of the above.
+	status, _ = wireCall(t, conn, 53, "Health", nil)
+	if status != 0 {
+		t.Fatalf("Health after normalization cases must succeed, got status=%d", status)
+	}
+}
+
+// The legacy GUI-child table must be untouched: it still carries the
+// privileged utility RPC, while the service allowlist exposes exactly the
+// five permitted methods and nothing else.
+func TestServiceAllowlistVsLegacyTable(t *testing.T) {
+	for _, method := range []string{"SetSystemDNS", "InstallDashboard", "Start", "Stop", "CheckConfig"} {
+		if handlers[method] == nil {
+			t.Fatalf("legacy handlers map lost %q — the GUI-child path must stay unchanged", method)
+		}
+	}
+	want := map[string]bool{"Hello": true, "Health": true, "CheckConfig": true, "Start": true, "Stop": true}
+	if len(serviceMethodAllowlist) != len(want) {
+		t.Fatalf("service allowlist size = %d, want %d", len(serviceMethodAllowlist), len(want))
+	}
+	for method := range serviceMethodAllowlist {
+		if !want[method] {
+			t.Fatalf("unexpected method %q in the service allowlist", method)
+		}
+	}
+	if _, err := dispatchService("SetSystemDNS", nil); err == nil || !strings.HasPrefix(err.Error(), errMethodNotAllowed) {
+		t.Fatalf("dispatchService must reject SetSystemDNS, got %v", err)
 	}
 }
 

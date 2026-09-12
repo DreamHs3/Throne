@@ -19,11 +19,12 @@ import (
 	"log"
 	"net"
 	"os"
+	runtimeDebug "runtime/debug"
 	"sync"
 	"time"
 
-	"github.com/tailscale/go-winio"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/tailscale/go-winio"
 	"golang.org/x/sys/windows/svc"
 	"google.golang.org/protobuf/proto"
 )
@@ -58,7 +59,33 @@ const (
 	errNoHandshake      = "ERR_NO_HANDSHAKE"
 	errProtocolVersion  = "ERR_PROTOCOL_VERSION"
 	errInvalidRequest   = "ERR_INVALID_REQUEST"
+	errMethodNotAllowed = "ERR_METHOD_NOT_ALLOWED"
 )
+
+// serviceMethodAllowlist is the ONLY method table a service-mode client can
+// reach after the handshake. It deliberately does NOT fall back to the legacy
+// handlers map: that table carries privileged utility RPC (SetSystemDNS,
+// InstallDashboard, CloseConnections, ...) and, via Start, the extra-process
+// execution surface — none of which a service client may drive. Remediation
+// of the PC-100 review P0.
+var serviceMethodAllowlist = map[string]handlerFn{
+	"Hello":       handle(globalServer.Hello),
+	"Health":      handle(globalServer.Health),
+	"CheckConfig": handle(globalServer.ServiceCheckConfig),
+	"Start":       handle(globalServer.ServiceStart),
+	"Stop":        handle(globalServer.Stop),
+}
+
+// dispatchService serves a service-mode client from the allowlist only. Every
+// other method — known to the legacy table or not — gets the same stable
+// typed error, and the legacy GUI-child dispatch is untouched.
+func dispatchService(method string, payload []byte) ([]byte, error) {
+	h, found := serviceMethodAllowlist[method]
+	if !found {
+		return nil, fmt.Errorf("%s: %q is not available in service mode", errMethodNotAllowed, method)
+	}
+	return h(context.Background(), payload)
+}
 
 func servicePipeName() string {
 	if v := os.Getenv("THRONE_SERVICE_PIPE"); v != "" {
@@ -338,12 +365,13 @@ func serveServiceConn(conn net.Conn) {
 			defer func() { <-sem }()
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("panic in %s: %v", method, r)
+					// Same stack parity as runDispatch: a panic must be diagnosable.
+					log.Printf("panic in %s: %v\n%s", method, r, runtimeDebug.Stack())
 					_ = writeServiceResponse(&writeMu, conn, id, 1,
 						[]byte(fmt.Sprintf("core panic in %s: %v", method, r)))
 				}
 			}()
-			respData, dispatchErr := dispatch(method, pl)
+			respData, dispatchErr := dispatchService(method, pl)
 			if dispatchErr != nil {
 				_ = writeServiceResponse(&writeMu, conn, id, 1, []byte(dispatchErr.Error()))
 			} else {
@@ -373,6 +401,64 @@ func (s *server) Health(ctx context.Context, _ *gen.EmptyReq) (*gen.HealthResp, 
 		RuntimeRunning:  To(currentBox() != nil),
 		ProtocolVersion: To(int32(serviceProtocolVersion)),
 	}, nil
+}
+
+// ServiceCheckConfig is the service-mode CheckConfig. It normalizes absent
+// proto2 optional fields to their defaults before delegating, because the
+// upstream handlers dereference optional pointers directly (server.go:579
+// `*in.CoreConfig`; also :399/:434/:474) and a client that omits a field
+// would otherwise crash the handler — an upstream robustness defect recorded
+// for the PC-110 typed contract, deliberately not patched in server.go.
+func (s *server) ServiceCheckConfig(ctx context.Context, in *gen.LoadConfigReq) (*gen.ErrorResp, error) {
+	normalizeLoadConfigReq(in)
+	return globalServer.CheckConfig(ctx, in)
+}
+
+// ServiceStart is the service-mode Start. It rejects the whole extra-process
+// execution surface — arbitrary executable path, arguments and config file —
+// before anything is parsed or spawned, then delegates to the legacy Start.
+//
+// Remaining (documented, unresolved in PC-100): the core_config/xray_config
+// JSON itself can still point the privileged runtime at arbitrary paths
+// (sing-box log.output / cache_file.path writes, TLS certificate/key reads,
+// Xray log file paths). Proving a safe Start therefore needs a
+// privileged-side config policy; the typed contract for it is PC-110 scope
+// (ADR-001: "Service не доверяет путям/JSON UI"). Until then service-mode
+// Start stays prototype-only and PC-100 stays BLOCKED.
+func (s *server) ServiceStart(ctx context.Context, in *gen.LoadConfigReq) (*gen.ErrorResp, error) {
+	if in.GetNeedExtraProcess() ||
+		in.GetExtraProcessPath() != "" ||
+		in.GetExtraProcessArgs() != "" ||
+		in.GetExtraProcessConf() != "" ||
+		in.GetExtraNoOut() {
+		return nil, fmt.Errorf("%s: extra process execution fields are not permitted in service mode", errInvalidRequest)
+	}
+	if in.GetNeedXray() && in.XrayConfig == nil {
+		return nil, fmt.Errorf("%s: need_xray requires xray_config", errInvalidRequest)
+	}
+	normalizeLoadConfigReq(in)
+	return globalServer.Start(ctx, in)
+}
+
+// normalizeLoadConfigReq materializes absent proto2 optional pointers to
+// their wire defaults so the legacy handlers' direct pointer dereferences
+// behave exactly as they do for the GUI, which always sends every field.
+func normalizeLoadConfigReq(in *gen.LoadConfigReq) {
+	if in == nil {
+		return
+	}
+	if in.CoreConfig == nil {
+		in.CoreConfig = proto.String("")
+	}
+	if in.NeedExtraProcess == nil {
+		in.NeedExtraProcess = proto.Bool(false)
+	}
+	if in.ExtraNoOut == nil {
+		in.ExtraNoOut = proto.Bool(false)
+	}
+	if in.NeedXray == nil {
+		in.NeedXray = proto.Bool(false)
+	}
 }
 
 func init() {
