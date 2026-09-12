@@ -65,9 +65,6 @@ Name: "{autodesktop}\ProxyCore"; Filename: "{app}\Throne.exe"
 [Registry]
 Root: HKA; Subkey: "Software\ProxyCore"; ValueType: string; ValueName: "InstallPath"; ValueData: "{app}"; Flags: uninsdeletekey
 
-[UninstallDelete]
-Type: files; Name: "{app}\updater.old"
-
 [Run]
 Filename: "{app}\Throne.exe"; Description: "{cm:LaunchProgram,ProxyCore}"; Flags: postinstall nowait skipifsilent
 
