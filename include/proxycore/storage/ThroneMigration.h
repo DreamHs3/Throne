@@ -32,9 +32,10 @@ namespace ProxyCore::Storage {
     // exists (nothing to roll back).
     RollbackResult RollbackMigration(const QString& targetConfigDir);
 
-    // Default Throne data dir: the sibling "Throne" directory of the running
-    // application's QStandardPaths::AppConfigLocation (the two differ only by
-    // application name). Portable/-appdata users pass an explicit path.
+    // Default Throne data dir: the sibling "Throne/config" directory of the
+    // running application's QStandardPaths::AppConfigLocation (the two differ
+    // only by application name; Throne stores its data in a "config"
+    // subdirectory). Portable/-appdata users pass an explicit path.
     QString DefaultThroneDataDir();
 
 }

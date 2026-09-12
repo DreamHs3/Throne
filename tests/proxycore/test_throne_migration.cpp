@@ -13,6 +13,8 @@
 #include <QStandardPaths>
 #include <QTemporaryDir>
 
+#include <SQLiteCpp/SQLiteCpp.h>
+
 #include "include/proxycore/storage/ThroneMigration.h"
 
 #define CHECK(cond)                                                                        \
@@ -38,12 +40,26 @@ namespace {
         return f.write(content) == content.size();
     }
 
-    // A small synthetic Throne data directory: db at the root plus nested files.
+    // A small synthetic Throne data directory: a real SQLite database at the
+    // root plus nested files.
     void makeThroneSource(const QDir& dir) {
-        writeFile(dir.absoluteFilePath("throne.db"), "fake-throne-db");
+        SQLite::Database db(dir.absoluteFilePath("throne.db").toStdString(),
+                            SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE);
+        db.exec("CREATE TABLE marker(v TEXT)");
+        db.exec("INSERT INTO marker VALUES('PC-TEST')");
         writeFile(dir.absoluteFilePath("config/profiles.json"), R"([{"tag":"example"}])");
         writeFile(dir.absoluteFilePath("config/sub/urls.txt"), "https://example.com/sub\n");
         writeFile(dir.absoluteFilePath(".hidden-marker"), "hidden");
+    }
+
+    bool markerRowReadable(const QString& dbPath, const char* expected) {
+        try {
+            SQLite::Database db(dbPath.toStdString(), SQLite::OPEN_READONLY);
+            SQLite::Statement query(db, "SELECT v FROM marker");
+            return query.executeStep() && query.getColumn(0).getString() == expected;
+        } catch (const std::exception&) {
+            return false;
+        }
     }
 
     int testMigrateFreshCopy(const QDir& source) {
@@ -51,6 +67,7 @@ namespace {
         QTemporaryDir target;
         CHECK(target.isValid());
 
+        const auto sourceDbHashBefore = hashFile(source.filePath("throne.db"));
         const auto result = ProxyCore::Storage::MigrateFromThrone(source.absolutePath(), target.path());
         CHECK(result.ok);
         CHECK(result.filesCopied == 4);
@@ -75,8 +92,11 @@ namespace {
         }
 
         // Source stays byte-identical: migration reads, never writes.
-        CHECK(hashFile(source.filePath("throne.db")) == QCryptographicHash::hash("fake-throne-db", QCryptographicHash::Sha256));
+        CHECK(hashFile(source.filePath("throne.db")) == sourceDbHashBefore);
         CHECK(hashFile(source.filePath("config/profiles.json")) == QCryptographicHash::hash(R"([{"tag":"example"}])", QCryptographicHash::Sha256));
+        // The migrated database is a readable SQLite snapshot of the source.
+        CHECK(markerRowReadable(target.filePath("throne.db"), "PC-TEST"));
+        CHECK(markerRowReadable(source.filePath("throne.db"), "PC-TEST"));
         return failures;
     }
 
@@ -141,16 +161,55 @@ namespace {
         return failures;
     }
 
+    // A Throne directory whose database is currently held open by a writer
+    // connection in WAL mode: the committed row lives in throne.db-wal, not
+    // in throne.db. The migration must still land a readable database at the
+    // target and must never ship -wal/-shm sidecars, while the live source
+    // (including the open writer) stays untouched.
+    int testMigrateLiveWalDatabase() {
+        int failures = 0;
+        QTemporaryDir source;
+        CHECK(source.isValid());
+        const QString dbPath = source.filePath("throne.db");
+        {
+            SQLite::Database db(dbPath.toStdString(), SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE);
+            db.exec("PRAGMA journal_mode=WAL");
+            db.exec("CREATE TABLE marker(v TEXT)");
+        }
+        // Held open across the migration on purpose: no checkpoint happens,
+        // so the committed row only exists in the WAL sidecar.
+        SQLite::Database writer(dbPath.toStdString(), SQLite::OPEN_READWRITE);
+        writer.exec("INSERT INTO marker VALUES('PC-TEST')");
+        CHECK(QFile::exists(source.filePath("throne.db-wal")));
+
+        QTemporaryDir target;
+        CHECK(target.isValid());
+        const auto result = ProxyCore::Storage::MigrateFromThrone(source.path(), target.path());
+        CHECK(result.ok);
+        CHECK(result.filesCopied == 1);
+        CHECK(QFile::exists(target.filePath("throne.db")));
+        CHECK(QFile::exists(target.filePath("throne.db-wal")) == false);
+        CHECK(QFile::exists(target.filePath("throne.db-shm")) == false);
+        CHECK(markerRowReadable(target.filePath("throne.db"), "PC-TEST"));
+
+        // The live source is still intact and the writer still works.
+        CHECK(markerRowReadable(source.filePath("throne.db"), "PC-TEST"));
+        writer.exec("INSERT INTO marker VALUES('PC-TEST-2')");
+        return failures;
+    }
+
     int testCoexistence() {
         // The data-dir contract Throne and ProxyCore both rely on: application
         // name selects the data directory, so two installed apps with
-        // different names never share one.
+        // different names never share one. Throne keeps its data in the
+        // "config" subdirectory of its data dir.
         int failures = 0;
         const QString ours = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
         CHECK(ours.endsWith("ProxyCore"));
         const QString throne = ProxyCore::Storage::DefaultThroneDataDir();
-        CHECK(throne.endsWith("Throne"));
+        CHECK(throne.endsWith("Throne/config"));
         CHECK(QDir(throne).absolutePath() != QDir(ours).absolutePath());
+        CHECK(QDir(QFileInfo(throne).absolutePath()).dirName() == QString("Throne"));
         return failures;
     }
 
@@ -174,6 +233,7 @@ int main(int argc, char* argv[]) {
     failures += testMigrateRefusesNonThroneSource();
     failures += testRollback(QDir(source.path()));
     failures += testStaleStagingRemoved(QDir(source.path()));
+    failures += testMigrateLiveWalDatabase();
     failures += testCoexistence();
 
     if (failures == 0) {

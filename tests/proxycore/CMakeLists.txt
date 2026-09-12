@@ -4,12 +4,25 @@
 enable_testing()
 
 # --- PC-010 migration/coexistence (QtCore only) ---
+# SQLiteCpp is linked in so the harness creates real SQLite databases and the
+# migration code exercises its consistent snapshot path.
 add_executable(proxycore_tests
         test_throne_migration.cpp
         ${CMAKE_SOURCE_DIR}/src/proxycore/storage/ThroneMigration.cpp
         ${CMAKE_SOURCE_DIR}/include/proxycore/storage/ThroneMigration.h
+        ${CMAKE_SOURCE_DIR}/3rdparty/SQLiteCpp/src/Backup.cpp
+        ${CMAKE_SOURCE_DIR}/3rdparty/SQLiteCpp/src/Column.cpp
+        ${CMAKE_SOURCE_DIR}/3rdparty/SQLiteCpp/src/Database.cpp
+        ${CMAKE_SOURCE_DIR}/3rdparty/SQLiteCpp/src/Exception.cpp
+        ${CMAKE_SOURCE_DIR}/3rdparty/SQLiteCpp/src/Savepoint.cpp
+        ${CMAKE_SOURCE_DIR}/3rdparty/SQLiteCpp/src/Statement.cpp
+        ${CMAKE_SOURCE_DIR}/3rdparty/SQLiteCpp/src/Transaction.cpp
+        ${CMAKE_SOURCE_DIR}/3rdparty/SQLiteCpp/src/sqlite3.c
 )
-target_include_directories(proxycore_tests PRIVATE ${CMAKE_SOURCE_DIR})
+target_include_directories(proxycore_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/3rdparty/SQLiteCpp/include
+)
 target_link_libraries(proxycore_tests PRIVATE Qt6::Core)
 add_test(NAME proxycore_migration COMMAND proxycore_tests)
 
