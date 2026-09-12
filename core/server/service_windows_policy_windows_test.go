@@ -1,6 +1,6 @@
 //go:build windows
 
-// PC-100 config-policy and identity-boundary tests (remediation round 2).
+// PC-100 config-policy and identity-boundary tests (remediation rounds 2-3).
 //
 // The filesystem policy (service_config_policy.go) is exercised directly and
 // over the real service wire framing (after Hello), the SDDL override guard
@@ -8,6 +8,9 @@
 // one test drives a REAL named pipe (winio listen + dial in this process) to
 // prove the client token identity path end to end. No SCM, no service
 // installation, no network; the only named pipe created is the test pipe.
+// Round 3 adds the parser-semantics suite: the strict-JSON fail-closed gate
+// (JSONC), case-folded deny keys / normalization / value prefixes, number
+// fidelity, and xray_full_configs parity.
 
 package main
 
@@ -112,20 +115,19 @@ func TestServiceConfigPolicyDropsDisabledCacheFilePath(t *testing.T) {
 	}
 }
 
-// The policy passes through what it does not own: malformed JSON and empty
-// documents are the runtime parser's business, and an empty log.output is a
-// legitimate boundary value.
+// The policy passes through only the empty document (a legitimate no-op);
+// everything else must be strict JSON the scan fully owns — remediation
+// round 3 rejects what the strict parser cannot read. An empty log.output is
+// a legitimate boundary value and must survive.
 func TestServiceConfigPolicyPassthrough(t *testing.T) {
-	for _, doc := range []string{"", "{ definitely not json }"} {
-		out, err := applyServiceConfigPolicy(doc, "")
-		if err != nil {
-			t.Fatalf("applyServiceConfigPolicy(%q) must not reject: %v", doc, err)
-		}
-		if out != doc {
-			t.Fatalf("applyServiceConfigPolicy(%q) = %q, want unchanged", doc, out)
-		}
+	out, err := applyServiceConfigPolicy("", "")
+	if err != nil {
+		t.Fatalf("applyServiceConfigPolicy(\"\") must not reject: %v", err)
 	}
-	out, err := applyServiceConfigPolicy(`{"log":{"output":""}}`, "")
+	if out != "" {
+		t.Fatalf("applyServiceConfigPolicy(\"\") = %q, want unchanged", out)
+	}
+	out, err = applyServiceConfigPolicy(`{"log":{"output":""}}`, "")
 	if err != nil {
 		t.Fatalf("empty log.output must be accepted: %v", err)
 	}
@@ -201,6 +203,9 @@ func TestServiceXrayConfigPolicy(t *testing.T) {
 		`{"route":{"external_ui":"C:\\ui"}}`,
 		`{"inbounds":[{"listen":"unix:///tmp/x.sock"}]}`,
 		`{"inbounds":[{"listen":"\\\\.\\pipe\\evil"}]}`,
+		// Unparseable documents fail closed (round 3): Xray's serial reader
+		// is permissive and would run what std json cannot read.
+		`{ broken`,
 	}
 	for _, doc := range rejected {
 		if err := validateServiceXrayConfigPolicy(doc); err == nil || !strings.HasPrefix(err.Error(), errConfigPolicy) {
@@ -209,7 +214,6 @@ func TestServiceXrayConfigPolicy(t *testing.T) {
 	}
 	accepted := []string{
 		``,
-		`{ broken`,
 		`{"log":{"loglevel":"warning"}}`,
 		`{"log":{"access":"none","error":"none"}}`,
 		`{"log":{"access":"","error":""}}`,
@@ -575,4 +579,262 @@ func tryReadResponse(r io.Reader) (uint32, uint8, []byte, error) {
 		}
 	}
 	return id, status, data, nil
+}
+
+// ---- remediation round 3: parser semantics ----
+//
+// The privileged runtimes parse the documents with different semantics than
+// the policy's strict std parser: sing's contextjson strips C-style
+// comments, Xray's serial reader accepts Java/Python comments, and both bind
+// JSON keys case-insensitively. The policy therefore fails closed on any
+// document the strict parser cannot read and folds every key and prefix
+// comparison; the tests in this section reproduce each hole and pin the fix.
+
+// A document the strict parser cannot read is rejected before the runtime can
+// execute semantics the policy never scanned. Pass-through was a bypass, not
+// a courtesy: the runtime's permissive parsers would happily run it.
+func TestServiceConfigPolicyFailClosedOnUnparseableDocuments(t *testing.T) {
+	rejected := []string{
+		"{ definitely not json }",
+		`{"log":{"output":"C:\\evil.log"}} /* c */`,
+		`{"log":{"output":"C:\\evil.log"}} // c`,
+		`{/* c */"log":{"output":"C:\\evil.log"}}`,
+		`{"log":{"output":"C:\\evil.log"},}`,
+		`{"log":{"output":"C:\\evil.log"}} {"log":{"output":"C:\\evil2.log"}}`,
+	}
+	for _, doc := range rejected {
+		if _, err := applyServiceConfigPolicy(doc, ""); err == nil || !strings.HasPrefix(err.Error(), errConfigPolicy) {
+			t.Errorf("core document %q must fail closed with %s, got %v", doc, errConfigPolicy, err)
+		}
+		if err := validateServiceXrayConfigPolicy(doc); err == nil || !strings.HasPrefix(err.Error(), errConfigPolicy) {
+			t.Errorf("Xray document %q must fail closed with %s, got %v", doc, errConfigPolicy, err)
+		}
+	}
+}
+
+// JSONC (/* */ and //) in core_config and xray_config must be rejected with
+// the typed policy error through BOTH Start and CheckConfig, and a Start
+// whose log.output points into a scratch directory must not create the file.
+func TestServiceWireRejectsJSONCDocuments(t *testing.T) {
+	conn, _ := serveOverPipe(t)
+	mustHandshake(t, conn)
+
+	// Whatever happens below, no runtime may survive the test (Stop is
+	// idempotent by upstream contract, so a double Stop is always safe).
+	defer func() {
+		_ = mustErrorResp(t, dispatchReq(t, "Stop", &gen.EmptyReq{}))
+		_ = mustErrorResp(t, dispatchReq(t, "Stop", &gen.EmptyReq{}))
+	}()
+
+	outDir := t.TempDir()
+	logSink := filepath.Join(outDir, "pwn.txt")
+	coreDoc := `{"log":{"output":` + quoteJSONString(t, logSink) + `}}`
+	xrayDoc := `{"log":{"error":` + quoteJSONString(t, logSink) + `}}`
+
+	cases := []struct {
+		name    string
+		method  string
+		payload *gen.LoadConfigReq
+	}{
+		{
+			name:   "core_config block comment, Start",
+			method: "Start",
+			payload: &gen.LoadConfigReq{
+				NeedExtraProcess: proto.Bool(false),
+				NeedXray:         proto.Bool(false),
+				CoreConfig:       proto.String(coreDoc + ` /* c */`),
+			},
+		},
+		{
+			name:   "core_config line comment, Start",
+			method: "Start",
+			payload: &gen.LoadConfigReq{
+				NeedExtraProcess: proto.Bool(false),
+				NeedXray:         proto.Bool(false),
+				CoreConfig:       proto.String(coreDoc + ` // c`),
+			},
+		},
+		{
+			name:   "core_config block comment, CheckConfig",
+			method: "CheckConfig",
+			payload: &gen.LoadConfigReq{
+				CoreConfig: proto.String(coreDoc + ` /* c */`),
+			},
+		},
+		{
+			name:   "core_config line comment, CheckConfig",
+			method: "CheckConfig",
+			payload: &gen.LoadConfigReq{
+				CoreConfig: proto.String(coreDoc + ` // c`),
+			},
+		},
+		{
+			name:   "xray_config block comment, Start",
+			method: "Start",
+			payload: &gen.LoadConfigReq{
+				NeedExtraProcess: proto.Bool(false),
+				NeedXray:         proto.Bool(true),
+				CoreConfig:       proto.String(`{"inbounds":[],"outbounds":[]}`),
+				XrayConfig:       proto.String(xrayDoc + ` /* c */`),
+			},
+		},
+		{
+			name:   "xray_config line comment, CheckConfig",
+			method: "CheckConfig",
+			payload: &gen.LoadConfigReq{
+				NeedXray:   proto.Bool(true),
+				CoreConfig: proto.String(`{"inbounds":[],"outbounds":[]}`),
+				XrayConfig: proto.String(xrayDoc + ` // c`),
+			},
+		},
+	}
+	for i, c := range cases {
+		status, data := wireCall(t, conn, uint32(500+i), c.method, mustMarshal(t, c.payload))
+		if status != 1 || !strings.HasPrefix(string(data), errConfigPolicy) {
+			t.Fatalf("%s: JSONC document must fail closed with %s, got status=%d data=%q", c.name, errConfigPolicy, status, string(data))
+		}
+	}
+
+	// The end-to-end point of the fix: a JSONC log sink is never executed,
+	// so the sink file is never created. (Pre-fix, the policy passed the
+	// document through untouched and the privileged runtime created it.)
+	assertAbsent(t, logSink)
+	if currentBox() != nil {
+		t.Fatal("a rejected JSONC config must not leave a runtime behind")
+	}
+}
+
+// JSON keys bind case-insensitively in both privileged parsers, so the deny
+// list and the wire path must decide on case-folded keys: LOG.OUTPUT,
+// CERTIFICATE_PATH and an Xray KEYFILE are the same fields as their
+// lowercase spellings, and IPC/device prefixes are case-insensitive too.
+func TestServiceConfigPolicyCaseVariantKeys(t *testing.T) {
+	outDir := t.TempDir()
+	logSink := filepath.Join(outDir, "evil.log")
+
+	coreRejected := []string{
+		`{"LOG":{"OUTPUT":"C:\\evil.log"}}`,
+		`{"Log":{"Output":"C:\\evil.log"}}`,
+		`{"outbounds":[{"type":"vless","tls":{"enabled":true,"CERTIFICATE_PATH":"C:\\cert.pem"}}]}`,
+		`{"outbounds":[{"type":"vless","tls":{"enabled":true,"Certificate_Path":"C:\\cert.pem"}}]}`,
+		`{"route":{"rule_set":[{"type":"local","tag":"ads","PATH":"C:\\rules\\ads.srs"}]}}`,
+		`{"inbounds":[{"type":"mixed","listen":"UNIX:///tmp/proxy.sock"}]}`,
+		`{"inbounds":[{"type":"mixed","listen":"\\\\.\\PIPE\\evil"}]}`,
+	}
+	for _, doc := range coreRejected {
+		if _, err := applyServiceConfigPolicy(doc, ""); err == nil || !strings.HasPrefix(err.Error(), errConfigPolicy) {
+			t.Errorf("case-variant deny key must be rejected (%s), got %v", doc, err)
+		}
+	}
+
+	xrayRejected := []string{
+		`{"log":{"ACCESS":"C:\\access.log"}}`,
+		`{"inbounds":[{"port":443,"streamSettings":{"tlsSettings":{"certificates":[{"certificateFile":"C:\\cert.pem","KEYFILE":"C:\\key.pem"}]}}}]}`,
+	}
+	for _, doc := range xrayRejected {
+		if err := validateServiceXrayConfigPolicy(doc); err == nil || !strings.HasPrefix(err.Error(), errConfigPolicy) {
+			t.Errorf("Xray case-variant deny key must be rejected (%s), got %v", doc, err)
+		}
+	}
+
+	// Wire parity: the case-variant sink is rejected through both methods
+	// and never executed.
+	conn, _ := serveOverPipe(t)
+	mustHandshake(t, conn)
+	doc := `{"LOG":{"OUTPUT":` + quoteJSONString(t, logSink) + `}}`
+	for i, method := range []string{"Start", "CheckConfig"} {
+		status, data := wireCall(t, conn, uint32(510+i), method, mustMarshal(t, &gen.LoadConfigReq{
+			NeedExtraProcess: proto.Bool(false),
+			NeedXray:         proto.Bool(false),
+			CoreConfig:       proto.String(doc),
+		}))
+		if status != 1 || !strings.HasPrefix(string(data), errConfigPolicy) {
+			t.Fatalf("%s: case-variant LOG.OUTPUT must fail closed with %s, got status=%d data=%q", method, errConfigPolicy, status, string(data))
+		}
+	}
+	assertAbsent(t, logSink)
+}
+
+// Normalization and its exemption must follow case-folded keys too: an
+// EXPERIMENTAL.CACHE_FILE block is the same runtime field as the lowercase
+// spelling, so it must be rewritten to the service-owned path (and fail
+// closed without a data dir), never smuggle a client path through.
+func TestServiceConfigPolicyNormalizesCaseVariantCacheFile(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("THRONE_SERVICE_DATA_DIR", dataDir)
+
+	out, err := applyServiceConfigPolicy(
+		`{"EXPERIMENTAL":{"CACHE_FILE":{"ENABLED":true,"PATH":"C:\\Windows\\Temp\\evil.db"}},"inbounds":[],"outbounds":[]}`,
+		configServiceDataDir())
+	if err != nil {
+		t.Fatalf("case-variant cache_file must be normalized, not rejected: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	cacheFile := parsed["EXPERIMENTAL"].(map[string]interface{})["CACHE_FILE"].(map[string]interface{})
+	if got, _ := cacheFile["path"].(string); got != filepath.Join(dataDir, "cache.db") {
+		t.Fatalf("case-variant cache_file path = %q, want %q, got: %s", got, filepath.Join(dataDir, "cache.db"), out)
+	}
+	if _, present := cacheFile["PATH"]; present {
+		t.Fatalf("the hostile case-variant PATH key must not survive the rewrite: %s", out)
+	}
+
+	// Duplicate keys differing only in case are one runtime field: every
+	// variant must be normalized, whichever map order the compiler picks.
+	out, err = applyServiceConfigPolicy(
+		`{"experimental":{"cache_file":{"enabled":false}},"EXPERIMENTAL":{"CACHE_FILE":{"ENABLED":true,"PATH":"C:\\Windows\\Temp\\evil.db"}},"inbounds":[],"outbounds":[]}`,
+		configServiceDataDir())
+	if err != nil {
+		t.Fatalf("duplicate case-variant cache_file blocks must normalize: %v", err)
+	}
+	if strings.Contains(out, "evil.db") {
+		t.Fatalf("no case variant may keep a client path: %s", out)
+	}
+	if !strings.Contains(out, quoteJSONString(t, filepath.Join(dataDir, "cache.db"))) {
+		t.Fatalf("the enabled variant must carry the service-owned path: %s", out)
+	}
+
+	// Fail closed without a data dir, same as the lowercase contract.
+	t.Setenv("THRONE_SERVICE_DATA_DIR", "")
+	if _, err := applyServiceConfigPolicy(`{"EXPERIMENTAL":{"CACHE_FILE":{"ENABLED":true}}}`, ""); err == nil || !strings.HasPrefix(err.Error(), errConfigPolicy) {
+		t.Fatalf("case-variant enabled cache_file without a data dir must fail with %s, got %v", errConfigPolicy, err)
+	}
+}
+
+// The runtime must see exactly the scanned tree: numbers survive the
+// re-marshal verbatim (json.Number), so a big int64 field cannot be silently
+// re-rounded by the policy's own decode.
+func TestServiceConfigPolicyPreservesNumberLiterals(t *testing.T) {
+	out, err := applyServiceConfigPolicy(`{"log":{"level":"warn"},"inbounds":[],"outbounds":[],"probe":{"id":9007199254740993}}`, "")
+	if err != nil {
+		t.Fatalf("a document with a big int64 must be accepted: %v", err)
+	}
+	if !strings.Contains(out, "9007199254740993") {
+		t.Fatalf("the number literal must survive the re-marshal verbatim, got %s", out)
+	}
+}
+
+// Start validates every xray_full_configs entry; CheckConfig must apply the
+// identical contract — a config validated in the morning must behave exactly
+// like one run in the evening, with no gap between the two methods.
+func TestServiceWireXrayFullConfigsParity(t *testing.T) {
+	conn, _ := serveOverPipe(t)
+	mustHandshake(t, conn)
+
+	hostile := `{"log":{"access":"C:\\Windows\\Temp\\evil.log"}}`
+	for i, method := range []string{"Start", "CheckConfig"} {
+		req := &gen.LoadConfigReq{
+			CoreConfig:      proto.String(`{"inbounds":[],"outbounds":[]}`),
+			XrayFullConfigs: []string{`{"log":{"loglevel":"warning"}}`, hostile},
+		}
+		status, data := wireCall(t, conn, uint32(520+i), method, mustMarshal(t, req))
+		if status != 1 || !strings.HasPrefix(string(data), errConfigPolicy) {
+			t.Fatalf("%s: an xray_full_configs entry with a deny key must fail closed with %s, got status=%d data=%q", method, errConfigPolicy, status, string(data))
+		}
+	}
+	if currentBox() != nil {
+		t.Fatal("parity rejections must not have started a runtime")
+	}
 }

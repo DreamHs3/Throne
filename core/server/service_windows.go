@@ -582,7 +582,9 @@ func (s *server) Health(ctx context.Context, _ *gen.EmptyReq) (*gen.HealthResp, 
 // for the PC-110 typed contract, deliberately not patched in server.go.
 // The same filesystem policy as Start is enforced so a config cannot be
 // validated in the morning and run in the evening (what CheckConfig accepts,
-// Start accepts; what Start rejects, CheckConfig rejects).
+// Start accepts; what Start rejects, CheckConfig rejects) — including
+// xray_config and every xray_full_configs entry, which Start validated and
+// CheckConfig skipped before round 3.
 func (s *server) ServiceCheckConfig(ctx context.Context, in *gen.LoadConfigReq) (*gen.ErrorResp, error) {
 	normalizeLoadConfigReq(in)
 	coreConfig, err := applyServiceConfigPolicy(in.GetCoreConfig(), configServiceDataDir())
@@ -592,6 +594,11 @@ func (s *server) ServiceCheckConfig(ctx context.Context, in *gen.LoadConfigReq) 
 	in.CoreConfig = proto.String(coreConfig)
 	if err := validateServiceXrayConfigPolicy(in.GetXrayConfig()); err != nil {
 		return nil, err
+	}
+	for _, full := range in.GetXrayFullConfigs() {
+		if err := validateServiceXrayConfigPolicy(full); err != nil {
+			return nil, err
+		}
 	}
 	return globalServer.CheckConfig(ctx, in)
 }

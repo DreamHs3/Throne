@@ -407,18 +407,31 @@ func TestServiceWireAllowedMethodsAndLifecycle(t *testing.T) {
 	conn, _ := serveOverPipe(t)
 	mustHandshake(t, conn)
 
+	// Round 3: the policy fails closed on documents the strict parser cannot
+	// read, so an unparseable config is now a typed policy rejection on the
+	// wire instead of an in-band config error from the runtime parser.
 	status, data := wireCall(t, conn, 40, "CheckConfig", mustMarshal(t, &gen.LoadConfigReq{
 		CoreConfig: proto.String("{ definitely not json }"),
 	}))
-	if status != 0 {
-		t.Fatalf("CheckConfig must be reachable over the service wire path, got status=%d data=%q", status, string(data))
+	if status != 1 || !strings.HasPrefix(string(data), errConfigPolicy) {
+		t.Fatalf("CheckConfig must fail closed with %s on an unparseable document, got status=%d data=%q", errConfigPolicy, status, string(data))
 	}
-	resp := &gen.ErrorResp{}
-	if err := proto.Unmarshal(data, resp); err != nil {
+
+	// Strict JSON that passes the policy but fails runtime validation still
+	// reports INSIDE ErrorResp (status=0): the typed policy rejection is
+	// reserved for policy violations, not runtime schema errors.
+	status, data = wireCall(t, conn, 46, "CheckConfig", mustMarshal(t, &gen.LoadConfigReq{
+		CoreConfig: proto.String(`{"inbounds":[{"type":"no-such-inbound-type"}],"outbounds":[]}`),
+	}))
+	if status != 0 {
+		t.Fatalf("CheckConfig must stay reachable over the service wire path, got status=%d data=%q", status, string(data))
+	}
+	checkResp := &gen.ErrorResp{}
+	if err := proto.Unmarshal(data, checkResp); err != nil {
 		t.Fatal(err)
 	}
-	if resp.GetError() == "" {
-		t.Fatal("CheckConfig must report an error for a malformed config")
+	if checkResp.GetError() == "" {
+		t.Fatal("CheckConfig must report a runtime schema error inside ErrorResp")
 	}
 
 	cfg := `{"log":{"level":"warn"},"inbounds":[],"outbounds":[]}`

@@ -4,9 +4,22 @@ package main
 // from the client and the privileged runtime would act on it as SYSTEM. The
 // policy closes the filesystem surface:
 //
+//   - the document is parsed strictly with std encoding/json semantics (no
+//     comments, exact numbers, no trailing data). A document the strict parser
+//     cannot read is REJECTED, never passed through: the privileged runtimes
+//     parse a strictly larger language (sing contextjson strips JSONC
+//     comments and binds keys case-insensitively; Xray's serial decoder
+//     accepts Java/Python comments), so "std-json can't read it, the runtime
+//     will" was a proven unscanned-document bypass (round 3).
+//   - keys are matched CASE-INSENSITIVELY against the deny list for the same
+//     reason: the runtime binders accept any case spelling, so
+//     {"LOG":{"OUTPUT":...}} would carry an unscanned log sink into the
+//     runtime (the re-marshaled document preserves the client's spelling).
 //   - normalized (never client-controlled): experimental.cache_file.path is
 //     rewritten to <THRONE_SERVICE_DATA_DIR>/cache.db, and the clash_api
-//     external_ui* keys are removed — Throne always emits these with
+//     external_ui* keys are removed — key lookup case-insensitive (as above;
+//     every case variant of an owned key is deleted before the service-owned
+//     value is written), and Throne always emits these fields with
 //     working-directory-relative values, which the service must not resolve
 //     (the service working directory is System32, not the install directory).
 //   - rejected (typed ERR_CONFIG_POLICY): every other path-bearing field —
@@ -14,8 +27,9 @@ package main
 //     client/mTLS, CA, MCA, CRL, static keys, wrapper scripts), SSH
 //     private_key_path, local/remote rule-set paths, tailscale/ACME/tor
 //     directories & executables, Xray log access/error files, Xray
-//     certificateFile/keyFile — plus unix:// and named-pipe/device string
-//     literals anywhere in the document.
+//     certificateFile/keyFile — plus unix-socket and named-pipe/device string
+//     literals anywhere in the document (prefix match case-insensitive:
+//     Windows pipe/device namespaces are case-insensitive).
 //
 // Deny-by-default on known path fields makes traversal (..\), absolute paths,
 // UNC and symlink/junction tricks moot: the field is never evaluated by the
@@ -25,6 +39,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,12 +54,13 @@ func configServiceDataDir() string {
 	return os.Getenv("THRONE_SERVICE_DATA_DIR")
 }
 
-// configPolicyDenyKeys rejects non-empty string values under these keys at
-// any depth of the document. The list was built by enumerating every
-// filesystem-bearing JSON key in the pinned sing-box `option` package (and
-// the Xray certificate block); route matchers (`process_path`,
-// `process_path_regex`) and the DERP `home` HTTP route are deliberately NOT
-// listed — they match or route, the core never opens those values as files.
+// configPolicyDenyKeys rejects non-empty string values under these keys (any
+// case spelling) at any depth of the document. The list was built by
+// enumerating every filesystem-bearing JSON key in the pinned sing-box
+// `option` package (and the Xray certificate block); route matchers
+// (`process_path`, `process_path_regex`) and the DERP `home` HTTP route are
+// deliberately NOT listed — they match or route, the core never opens those
+// values as files.
 var configPolicyDenyKeys = map[string]bool{
 	"output":                      true, // sing-box log.output (and any unknown sink)
 	"path":                        true, // local/predefined rule-sets, hosts file, misc
@@ -84,9 +100,11 @@ var configPolicyDenyKeys = map[string]bool{
 }
 
 // configPolicyValuePrefixes rejects string values that name IPC/device paths
-// regardless of the key they appear under.
+// regardless of the key they appear under. Matching is case-insensitive
+// (configPolicyValueDenied): Windows pipe and device namespaces are
+// case-insensitive, and "unix:" also covers the bare gRPC socket form.
 var configPolicyValuePrefixes = []string{
-	"unix://",  // unix socket listens (v2ray api, sing-box inbounds)
+	"unix:",    // unix sockets (gRPC bare form; subsumes "unix://")
 	`\\.\pipe`, // Windows named pipes
 	`\\.\`,     // Windows device paths
 	`\\?\`,     // extended-length device paths
@@ -94,16 +112,20 @@ var configPolicyValuePrefixes = []string{
 
 // applyServiceConfigPolicy validates a sing-box JSON document and rewrites
 // the client-controlled working-directory-relative fields to service-owned
-// absolute values. The returned string is the document the runtime sees.
+// absolute values. The returned string is the document the runtime sees —
+// exactly the scanned tree re-marshaled (scan-what-you-run), with numbers
+// preserved lexically.
 func applyServiceConfigPolicy(coreConfigJSON string, serviceDataDir string) (string, error) {
 	trimmed := strings.TrimSpace(coreConfigJSON)
 	if trimmed == "" {
 		return coreConfigJSON, nil
 	}
-	var root map[string]interface{}
-	if err := json.Unmarshal([]byte(trimmed), &root); err != nil {
-		// Not our concern: the runtime's own parser reports malformed JSON.
-		return coreConfigJSON, nil
+	root, err := parsePolicyDocument(trimmed)
+	if err != nil {
+		// Fail closed: a document the strict parser cannot read but a
+		// runtime parser (JSONC comments) can is an unscanned bypass.
+		// Genuinely malformed JSON is rejected by the runtime anyway.
+		return "", fmt.Errorf("%s: not valid strict JSON: %v", errConfigPolicy, err)
 	}
 
 	if err := normalizeServiceCoreConfig(root, serviceDataDir); err != nil {
@@ -129,14 +151,36 @@ func validateServiceXrayConfigPolicy(xrayConfigJSON string) error {
 	if trimmed == "" {
 		return nil
 	}
-	var root map[string]interface{}
-	if err := json.Unmarshal([]byte(trimmed), &root); err != nil {
-		return nil // the runtime's own parser reports malformed JSON
+	root, err := parsePolicyDocument(trimmed)
+	if err != nil {
+		// Fail closed: Xray's serial decoder accepts Java/Python comments
+		// the strict parser rejects; anything unscannable is rejected.
+		return fmt.Errorf("%s: not valid strict JSON: %v", errConfigPolicy, err)
 	}
 	if err := scanConfigPolicy(root, "$", ""); err != nil {
 		return fmt.Errorf("%s: %v", errConfigPolicy, err)
 	}
 	return nil
+}
+
+// parsePolicyDocument parses a JSON document with std encoding/json
+// strictness into the scanned shape: no comments, no trailing data, no
+// non-object roots. Numbers stay json.Number so the re-marshal reproduces
+// them exactly (a float64 round trip silently rewrote large int64 values).
+func parsePolicyDocument(trimmed string) (map[string]interface{}, error) {
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	dec.UseNumber()
+	var root map[string]interface{}
+	if err := dec.Decode(&root); err != nil {
+		return nil, err
+	}
+	// Decoder.Decode reads only the first value; std json.Unmarshal also
+	// rejects trailing data, and the runtime parsers might accept it — keep
+	// the strictness.
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, fmt.Errorf("unexpected trailing data after the JSON document")
+	}
+	return root, nil
 }
 
 // normalizeServiceCoreConfig rewrites the two fields Throne always emits with
@@ -148,38 +192,126 @@ func validateServiceXrayConfigPolicy(xrayConfigJSON string) error {
 //   - experimental.clash_api.external_ui* keys are removed (the UI is not the
 //     core's business, and the value is a directory the core would serve or
 //     download into).
+//
+// Key lookup is case-insensitive: the runtime binder accepts EXPERIMENTAL /
+// CACHE_FILE / ENABLED / PATH exactly like the lowercase spellings, so a
+// case-variant object would otherwise bypass both the rewrite and the scan
+// exemption. Case-variant spellings of the owned keys are deleted, never
+// overwritten (an added canonical key would leave the hostile spelling in
+// the re-marshaled document).
 func normalizeServiceCoreConfig(root map[string]interface{}, serviceDataDir string) error {
-	experimental, ok := root["experimental"].(map[string]interface{})
-	if !ok {
-		return nil
-	}
-	if cacheFile, ok := experimental["cache_file"].(map[string]interface{}); ok {
-		if enabled, _ := cacheFile["enabled"].(bool); enabled {
-			if serviceDataDir == "" {
-				return fmt.Errorf("cache_file is enabled but the service data directory is not configured (THRONE_SERVICE_DATA_DIR)")
-			}
-			cacheFile["path"] = filepath.Join(serviceDataDir, "cache.db")
-		} else {
-			delete(cacheFile, "path")
+	for key, value := range root {
+		if !strings.EqualFold(key, "experimental") {
+			continue
 		}
-	}
-	if clashAPI, ok := experimental["clash_api"].(map[string]interface{}); ok {
-		delete(clashAPI, "external_ui")
-		delete(clashAPI, "external_ui_download_url")
-		delete(clashAPI, "external_ui_download_detour")
-		if len(clashAPI) == 0 {
-			delete(experimental, "clash_api")
+		experimental, ok := value.(map[string]interface{})
+		if !ok {
+			// Not an object: nothing to normalize; the runtime parser
+			// rejects it and the scan below still runs on the document.
+			continue
 		}
-	}
-	if len(experimental) == 0 {
-		delete(root, "experimental")
+		if err := normalizeCacheFile(experimental, serviceDataDir); err != nil {
+			return err
+		}
+		normalizeClashAPI(experimental)
+		if len(experimental) == 0 {
+			delete(root, key)
+		}
 	}
 	return nil
 }
 
+// normalizeCacheFile handles every case-variant spelling of
+// experimental.cache_file inside one experimental object.
+func normalizeCacheFile(experimental map[string]interface{}, serviceDataDir string) error {
+	for key, value := range experimental {
+		if !strings.EqualFold(key, "cache_file") {
+			continue
+		}
+		cacheFile, ok := value.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		// Fail closed on ambiguity: if any spelling claims enabled=true, the
+		// data-dir contract applies (a path we write for a runtime that ends
+		// up disabled is harmless; the reverse direction is not).
+		enabled := false
+		for k, v := range cacheFile {
+			if strings.EqualFold(k, "enabled") {
+				if b, ok := v.(bool); ok && b {
+					enabled = true
+				}
+			}
+		}
+		for k := range cacheFile {
+			if strings.EqualFold(k, "path") {
+				delete(cacheFile, k)
+			}
+		}
+		if enabled {
+			if serviceDataDir == "" {
+				return fmt.Errorf("cache_file is enabled but the service data directory is not configured (THRONE_SERVICE_DATA_DIR)")
+			}
+			cacheFile["path"] = filepath.Join(serviceDataDir, "cache.db")
+		}
+	}
+	return nil
+}
+
+// normalizeClashAPI handles every case-variant spelling of
+// experimental.clash_api inside one experimental object.
+func normalizeClashAPI(experimental map[string]interface{}) {
+	for key, value := range experimental {
+		if !strings.EqualFold(key, "clash_api") {
+			continue
+		}
+		clashAPI, ok := value.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		for k := range clashAPI {
+			if strings.EqualFold(k, "external_ui") ||
+				strings.EqualFold(k, "external_ui_download_url") ||
+				strings.EqualFold(k, "external_ui_download_detour") {
+				delete(clashAPI, k)
+			}
+		}
+		if len(clashAPI) == 0 {
+			delete(experimental, key)
+		}
+	}
+}
+
+// configPolicyKeyDenied reports whether key names (case-insensitively) a
+// denied key. EqualFold, not a map lookup: the runtime's JSON binder matches
+// struct fields case-insensitively, so "OUTPUT" binds to log.output exactly
+// like "output" does.
+func configPolicyKeyDenied(key string) bool {
+	for denied := range configPolicyDenyKeys {
+		if strings.EqualFold(denied, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// configPolicyValueDenied reports whether value names an IPC/device path,
+// case-insensitively: \\.\PIPE\evil names the same pipe as \\.\pipe\evil.
+func configPolicyValueDenied(value string) bool {
+	folded := strings.ToLower(value)
+	for _, prefix := range configPolicyValuePrefixes {
+		if strings.HasPrefix(folded, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // scanConfigPolicy walks the document and rejects every denied key and
 // device/IPC string literal. The single exemption is
-// experimental.cache_file.path, which the normalization step owns.
+// experimental.cache_file.path (any case spelling — normalization owns them
+// all, and every spelling it does not own has been deleted by the time the
+// scan runs).
 func scanConfigPolicy(node interface{}, where string, parentKey string) error {
 	switch value := node.(type) {
 	case map[string]interface{}:
@@ -187,12 +319,12 @@ func scanConfigPolicy(node interface{}, where string, parentKey string) error {
 			if err := scanConfigPolicy(child, where+"."+key, key); err != nil {
 				return err
 			}
-			if !configPolicyDenyKeys[key] {
+			if !configPolicyKeyDenied(key) {
 				continue
 			}
 			// The normalized cache_file path is service-owned (this is the
 			// child's full path: `where` still points at the parent here).
-			if key == "path" && where+"."+key == "$.experimental.cache_file.path" {
+			if strings.EqualFold(key, "path") && strings.EqualFold(where+"."+key, "$.experimental.cache_file.path") {
 				continue
 			}
 			switch typed := child.(type) {
@@ -208,12 +340,16 @@ func scanConfigPolicy(node interface{}, where string, parentKey string) error {
 				}
 			}
 		}
-		// Xray "log" objects: file sinks arrive via access/error ("output" is
+		// Xray "log" objects (any case spelling of the object and of the
+		// sink keys): file sinks arrive via access/error ("output" is
 		// blanket-denied above). Only "none"/empty is acceptable.
-		if key0 := lastPathSegment(where); key0 == "log" {
-			for _, sink := range []string{"access", "error"} {
-				if v, ok := value[sink].(string); ok && v != "" && v != "none" {
-					return fmt.Errorf("%s.%s: log file paths are not permitted in service configs", where, sink)
+		if strings.EqualFold(lastPathSegment(where), "log") {
+			for key, sink := range value {
+				if !strings.EqualFold(key, "access") && !strings.EqualFold(key, "error") {
+					continue
+				}
+				if v, ok := sink.(string); ok && v != "" && v != "none" {
+					return fmt.Errorf("%s.%s: log file paths are not permitted in service configs", where, key)
 				}
 			}
 		}
@@ -224,10 +360,8 @@ func scanConfigPolicy(node interface{}, where string, parentKey string) error {
 			}
 		}
 	case string:
-		for _, prefix := range configPolicyValuePrefixes {
-			if strings.HasPrefix(value, prefix) {
-				return fmt.Errorf("%s: IPC/device paths (%q...) are not permitted in service configs", where, prefix)
-			}
+		if configPolicyValueDenied(value) {
+			return fmt.Errorf("%s: IPC/device paths are not permitted in service configs", where)
 		}
 	}
 	return nil

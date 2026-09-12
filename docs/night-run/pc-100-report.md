@@ -135,20 +135,96 @@ only by the new test suite — vet/build alone had passed all of them:
    array — any token with more than one group panicked the accept loop. The
    members are now re-sliced with `unsafe.Slice` (`tokenGroupSIDs`).
 
+## Remediation round 3 — parser semantics (config-policy bypasses, review P0)
+
+An independent read-only review of the round-2 code (2026-09-12) found the
+config policy **bypassed end-to-end** and proved it by execution on the
+development machine, not theory. The policy scanned the document with std
+`encoding/json` while the privileged runtimes parse the same document with
+different semantics. Three holes:
+
+1. **JSONC comments.** On a std-json parse error both policy entry points
+   returned the document unscanned with a nil error ("the runtime's own
+   parser reports malformed JSON"). But sing's contextjson strips C-style
+   comments before parsing (`stripJSONComments`), and the pinned xray-core
+   serial loader is documented permissive (Java/Python comments): a config
+   `{"log":{"output":"C:\\…\\pwn.txt"}} /* c */` passed the policy untouched
+   and a real `ServiceStart` executed it — the privileged runtime created
+   the file.
+2. **Case-insensitive key binding.** The scan used exact map lookups; both
+   runtimes bind JSON keys to config fields case-insensitively.
+   `{"LOG":{"OUTPUT":"…"}}` passed the deny map, the re-marshal kept the
+   client's spelling, and the runtime bound it to `log.output`.
+3. **Xray branch.** `validateServiceXrayConfigPolicy` had the same
+   pass-through on a parse error.
+
+The deny-list CONTENT was re-verified correct (enumerated against the pinned
+sing-box `option` package) — the failure was parsing semantics, so the fix
+changes semantics, not the list (`core/server/service_config_policy.go`):
+
+- **Fail-closed parsing**: a document the strict std parser cannot read
+  (comments, trailing commas, trailing data, non-object roots) is rejected
+  with typed `ERR_CONFIG_POLICY` in BOTH entry points instead of passed
+  through. Genuinely malformed JSON is rejected by the runtime anyway — no
+  legitimate configs are lost.
+- **Case-folded key matching** (`strings.EqualFold`) in the deny scan, the
+  Xray `log.access`/`error` sink check, and the normalization/exemption key
+  lookups. Every case variant of a key the policy owns (`path`,
+  `external_ui*`) is deleted before the service-owned value is written —
+  merely adding a canonical key would have left the hostile spelling in the
+  re-marshaled document.
+- **Scan-what-you-run kept**: the runtime still sees exactly the scanned
+  tree (re-marshal of the scanned map), with numbers preserved verbatim via
+  `json.Decoder.UseNumber()` (a float64 round trip silently re-rounded large
+  int64 values).
+- **Value prefixes matched case-insensitively** (Windows pipe/device
+  namespaces are case-insensitive: `\\.\PIPE\evil` names the same pipe as
+  `\\.\pipe\evil`), and the bare gRPC form `unix:` added alongside
+  `unix://`.
+- **CheckConfig↔Start parity** (review P2): `ServiceCheckConfig` now
+  validates `xray_full_configs` exactly like `ServiceStart` always did.
+- **SDDL guard hardening** (`service_windows.go`, review P2): raw-SID
+  trustees are now treated like abbreviations — `D:P(A;;GA;;;S-1-1-0)`
+  (Everyone) and `D:P(A;;GA;;;S-1-5-32-545)` (Builtin Users) previously
+  passed the guard; it now also refuses the raw SIDs of Everyone (`S-1-1-0`),
+  Anonymous (`S-1-5-7`), Authenticated Users (`S-1-5-11`), Builtin Users
+  (`S-1-5-32-545`) and Builtin Guests (`S-1-5-32-546`) at listener start.
+  Defense-in-depth for an admin-controlled variable.
+
+Round-3 acceptance tests (32 PC-100 tests total, all green at `-count=20`):
+strict-JSON fail-closed matrix (JSONC spellings, trailing comma, trailing
+data, non-object roots) for both entry points; JSONC in `core_config` and
+`xray_config` rejected over the wire by Start AND CheckConfig with the sink
+file never created; case-variant deny keys (`LOG.OUTPUT`, `CERTIFICATE_PATH`,
+Xray `KEYFILE`, `UNIX://`, `\\.\PIPE`) asserted directly and over the wire;
+case-variant normalization (`EXPERIMENTAL.CACHE_FILE.ENABLED` rewritten to
+the service-owned path, duplicate case-variant blocks, fail-closed without a
+data dir); number fidelity; `xray_full_configs` parity through both methods;
+SDDL raw-SID refusal at the listener; the round-2 lowercase matrix stays
+green. **PC-100 remains BLOCKED** — nothing here substitutes the VM evidence
+(SCM start/stop, non-elevated client refusal, SDDL refusal under a normal
+user).
+
+Round-2 count correction: the round-2 suite added **10** tests (not 9) for
+**25** total (not 24); the command blocks below are corrected.
+
 ## Why BLOCKED (not PASS)
 
-1. **Config-content policy — implemented in round 2, VM evidence outstanding.**
+1. **Config-content policy — implemented in rounds 2-3, VM evidence outstanding.**
    `Start` hands the client-supplied `core_config` (full sing-box JSON),
    optional `xray_config`/`xray_full_configs` (Xray JSON) and `tun_ipv4_cidr`
    to the privileged runtime. That JSON can direct the SYSTEM-privileged core
    to **write files** (sing-box `log.output`, `experimental.cache_file.path`;
    Xray `log.access`/`log.error`) and **read files** (TLS
-   `certificate_path`/`key_path`, geoip/geosite paths). Round 2 closes this
-   surface in code: normalization + deny-by-default rejection of every
-   filesystem-bearing field, proven by a wire-level traversal matrix
-   (absolute, `..\` and junction cache paths land only in the service data
-   directory). What remains BLOCKED is the VM-side acceptance: SCM start/stop
-   with the policy active, and the non-elevated client procedure below.
+   `certificate_path`/`key_path`, geoip/geosite paths). Round 2 closed this
+   surface in code (normalization + deny-by-default rejection of every
+   filesystem-bearing field, proven by a wire-level traversal matrix —
+   absolute, `..\` and junction cache paths land only in the service data
+   directory). Round 3 closed the parser-semantics bypasses of that policy an
+   independent review proved end-to-end (JSONC comments, case-variant keys —
+   see the round-3 section). What remains BLOCKED is the VM-side acceptance:
+   SCM start/stop with the policy active, and the non-elevated client
+   procedure below.
 2. **SCM evidence missing** — no disposable Windows VM; `sc create/start/stop`
    and the non-elevated client procedure below have never been executed.
 3. SDDL/peer-SID behavior on a real VM (refusal of a non-elevated client
@@ -211,7 +287,7 @@ Windows SCM").
 | Incompatible client gets typed error | PASS | `TestServiceHandshakeVersionMismatchTypedError` (`ERR_PROTOCOL_VERSION`, disconnect) |
 | No GUI → no service crash | PASS | disconnect/reconnect keeps serving (Health OK after reconnect) |
 | Secrets/full config not in logs | PASS | `TestServiceModeNeverLogsConfigSecrets` (marker not logged even with THRONE_CORE_DEBUG=1; child-mode debug dump stays a documented upstream debt) |
-| Handshake/Health/CheckConfig/Start/Stop only | **BLOCKED** | Pre-remediation this row claimed PASS — that claim was **wrong**: the serve loop called the general `dispatch()` and exposed the whole legacy handlers table (review P0). Post-remediation the service path uses an explicit five-method allowlist with typed `ERR_METHOD_NOT_ALLOWED` for everything else; proven by wire-path tests. The config-content policy gap (review P0 #2) is closed in code in round 2 — normalization + deny-by-default with a wire-level traversal matrix; full safe-Start proof on a VM is still outstanding |
+| Handshake/Health/CheckConfig/Start/Stop only | **BLOCKED** | Pre-remediation this row claimed PASS — that claim was **wrong**: the serve loop called the general `dispatch()` and exposed the whole legacy handlers table (review P0). Post-remediation the service path uses an explicit five-method allowlist with typed `ERR_METHOD_NOT_ALLOWED` for everything else; proven by wire-path tests. The config-content policy gap (review P0 #2) is closed in code in round 2 (normalization + deny-by-default with a wire-level traversal matrix) and its parser-semantics bypasses (JSONC comments, case-variant keys) in round 3; full safe-Start proof on a VM is still outstanding |
 | Real SCM test | **BLOCKED** | requires disposable Windows VM + service registration; procedure below |
 
 ## Commands and results (post-remediation)
@@ -234,8 +310,24 @@ Round 2 (config policy + identity boundary):
 gofmt -l (changed files)                           → clean
 go vet (CI tags, root package)                     → exit 0
 go build (CI tags)                                 → exit 0
-go test -count=20 (24 PC-100 tests: 15 round-1 +
-  9 round-2, CI tags, -ldflags="-checklinkname=0") → ok  (24 × 20 runs)
+go test -count=20 (25 PC-100 tests: 15 round-1 +
+  10 round-2, CI tags, -ldflags="-checklinkname=0") → ok  (25 × 20 runs)
+go test . ./internal/xray/ ./internal/xraydns/     → all ok (regression)
+git diff --check                                   → clean
+```
+
+Round 3 (parser semantics — fail-closed parsing, case-folded keys, SDDL
+raw-SID trustees):
+
+```
+gofmt -l (changed files)                           → clean
+go vet -a (CI tags, ./...)                         → exactly one pre-existing
+                                                     finding (unreachable code,
+                                                     internal/boxdns/dns_manager_windows.go:246)
+go build (CI tags)                                 → exit 0
+go test -count=20 (32 PC-100 tests: 15 round-1 +
+  10 round-2 + 7 round-3, CI tags,
+  -ldflags="-checklinkname=0")                     → ok  (32 × 20 runs)
 go test . ./internal/xray/ ./internal/xraydns/     → all ok (regression)
 git diff --check                                   → clean
 ```
@@ -250,9 +342,11 @@ with `-a`.
 
 Pre-remediation suite (10 tests) passed once; the external review then found
 the P0 dispatch-table exposure — fixed as described above. Round 2 added the
-config-policy and identity suites (9 tests, including the wire traversal
-matrix and a real named-pipe identity round trip) and re-verified everything
-at -count=20.
+config-policy and identity suites (10 tests — the original "9 tests / 24
+total" bookkeeping was off by one and corrected in round 3 — including the
+wire traversal matrix and a real named-pipe identity round trip); round 3
+added the parser-semantics suite (7 tests). Everything re-verified at
+-count=20.
 
 ## Manual SCM procedure (VM only, BLOCKED here)
 
