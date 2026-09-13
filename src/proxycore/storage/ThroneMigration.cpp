@@ -11,7 +11,7 @@
 #include <QStandardPaths>
 #include <utility>
 
-#include <SQLiteCpp/SQLiteCpp.h>
+#include <3rdparty/SQLiteCpp/include/SQLiteCpp.h>
 
 namespace ProxyCore::Storage {
 
