@@ -233,3 +233,64 @@ bypassed end-to-end (P0) — proven by execution on this machine, not theory.
   not committed, still `M` in the working tree; all commits use explicit
   `git add <files>`, proto verified absent from each commit via
   `git log --name-only`.
+
+## PC-110 — 2026-09-13 (versioned typed envelope on the service pipe)
+
+Branch: `agent/night-stage1-service-spike`, start HEAD `2e1a6384`
+(`fix: remediate audit findings and restore baseline delta`). Working tree
+at start: only the owner's `libcore.proto` PC-110 WIP (+23 lines,
+RequestEnvelope/ResponseEnvelope) — committed WITH this package by explicit
+handoff authorization (single PC-110 commit, no other dirty fragments
+existed; provenance fixed before any edit: the two envelope messages after
+HealthResp, before LoadConfigReq).
+
+- [PC-110] New `core/server/service_envelope_windows.go`: framing
+  `[u32 frameLen][RequestEnvelope]` / `[u32 frameLen][ResponseEnvelope]`;
+  envelope codes 0..9 (mirrored in the proto comment); frame length checked
+  against 32 MiB BEFORE allocation; 64 MiB aggregate payload-budget semaphore
+  held until the handler completes; the single operation registry
+  `serviceOperations` (Hello/Health/CheckConfig/Start/Stop — the PC-100
+  serviceMethodAllowlist is gone, no second table); STRICT typed payload
+  decode (unknown-field residue from another message type or a newer client
+  → typed refusal); bounded per-connection request-id dedup (4096, ids
+  recorded only for executed requests); client deadline → handler context;
+  handler-error → code classifier (ERR_* prefixes → code 3, deadline → 5,
+  else/panic → 8).
+- [PC-110] `service_windows.go` serve loop rewritten to the envelope
+  protocol, validation order: version → shutdown → handshake state →
+  request_id → deadline → expected policy revision → registry → typed
+  payload → dedup → spawn. Refused requests never break the connection;
+  version incompatibility and oversized frames do. Shutdown refuses new work
+  (code 7) and starts no new handlers (check before spawn; both slot waits
+  abort on ctx). SDDL/SDDL guard/identity boundary/SCM handler untouched.
+- [PC-110] `service_config_policy.go`: + `configPolicyRevision = 1`
+  (expected_policy_revision pinning; stale → code 6 naming both revisions).
+  Policy semantics unchanged; Start/CheckConfig keep the shared policy (the
+  registry binds them to the Service* handlers — proven by the divergence
+  test: registry refuses a hostile doc, legacy dispatch accepts the same one).
+- [PC-110] Legacy GUI-child untouched by construction: dispatch.go byte
+  identical; envelopes never enter runDispatch; TestLegacyModeIsDefault-
+  AndDispatchUnchanged stays green. Generated bindings verified identical to
+  a fresh protoc regeneration (no regen needed).
+- [PC-110] Tests: all PC-100 wire tests migrated to the envelope framing
+  (32 PC-100 behaviors preserved) + new focused PC-110 suite (13 tests:
+  versions, unknown/wrong payloads, oversized-before-allocation, expired
+  deadline not dispatched, stale revision, request_id echo/required/dedup
+  completed+in-flight, shutdown vs pending handler slots and pending payload
+  budget, registry-vs-legacy divergence). Full details:
+  `docs/night-run/pc-110-report.md`, ADR-002 addendum №4.
+- [PC-110] Checks: build exit 0; `go vet -a ./...` → exactly the one
+  pre-existing finding (internal/boxdns/dns_manager_windows.go:246);
+  PC-100+PC-110 suites `-count=20` ok (44 tests × 20; 4 rounds) and
+  real-pipe/SCM/shutdown `-count=50` ok (200/200); `go test ./...` matches
+  the baseline (the 8 pre-existing winipcfg environment failures only);
+  gofmt clean; `git diff --check` clean; check_no_updater.sh exit 0.
+- [PC-110] One-time flake recorded honestly: the first `-count=20` run timed
+  out at 600s with a go-winio ListenPipe goroutine dump; never reproduced in
+  4 full rounds + 200 targeted runs + the final regression. All new-test
+  waits are bounded, so the winio listener machinery on this desktop machine
+  remains the suspect; neither counted as pass nor hidden.
+- [PC-100/PC-110] Status: PC-100 stays **BLOCKED** (VM evidence: SCM
+  start/stop, non-elevated refusal, SDDL refusal under a normal user); PC-110
+  inherits every VM-bound item. Gate 0/1 remain open. No push, no service
+  installed, no network mutations.

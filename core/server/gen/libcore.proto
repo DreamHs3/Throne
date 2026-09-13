@@ -65,6 +65,29 @@ message HealthResp {
   optional int32 protocol_version = 2 [default = 0];
 }
 
+// PC-110 versioned service IPC envelope (additive; service path only — the
+// legacy GUI-child framing in runDispatch is unchanged). Response.code uses
+// the documented EnvelopeCode values (0=OK, 1=incompatible version,
+// 2=unauthorized client, 3=invalid request, 4=frame too large,
+// 5=deadline exceeded, 6=stale revision, 7=service unavailable,
+// 8=runtime failure, 9=duplicate request).
+message RequestEnvelope {
+  optional int32 protocol_version = 1 [default = 0];
+  optional uint64 request_id = 2 [default = 0];
+  optional string operation = 3 [default = ""];
+  optional int64 deadline_unix_ms = 4 [default = 0];
+  optional int64 expected_policy_revision = 5 [default = 0];
+  optional bytes typed_payload = 6;
+}
+
+message ResponseEnvelope {
+  optional uint64 request_id = 1 [default = 0];
+  optional int32 code = 2 [default = 0];
+  optional string message = 3 [default = ""];
+  optional bytes typed_payload = 4;
+  optional int32 service_protocol_version = 5 [default = 0];
+}
+
 message LoadConfigReq {
   optional string core_config = 1 [default = ""];
   optional bool disable_stats = 2 [default = false];

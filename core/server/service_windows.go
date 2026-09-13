@@ -13,10 +13,8 @@ import (
 	"ThroneCore/gen"
 	"ThroneCore/internal/xray"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
@@ -45,10 +43,11 @@ const (
 	// spike honest without pretending a full SID validation exists (PC-110).
 	defaultServiceSDDL = "D:P(A;;GA;;;SY)(A;;GA;;;BA)"
 
-	// Wire-level sanity guards for the new service path only; the formal
-	// frame/request limit contract arrives with PC-110.
-	serviceMaxMethodLen   = 4096
-	serviceMaxPayloadLen  = 32 << 20
+	// Per-connection and aggregate bounds for the service path. The frame and
+	// payload limit contract (PC-110) lives in service_envelope_windows.go:
+	// serviceMaxEnvelopeLen bounds one request frame and is checked before
+	// any allocation; servicePayloadBudget bounds the aggregate envelope
+	// memory held across the service.
 	serviceMaxConnections = 16
 	servicePayloadBudget  = 64 << 20
 
@@ -62,42 +61,35 @@ const (
 var serviceReadTimeout = 30 * time.Second
 var serviceWriteTimeout = 30 * time.Second
 
-// The service pipe protocol version; incompatible clients get a typed error.
+// The service pipe protocol version, carried in every RequestEnvelope and
+// checked before anything dispatches. Version 1 is the PC-110 typed envelope
+// protocol; the pre-envelope PC-100 spike framing never shipped to a client.
+// Incompatible clients get the typed version error and are disconnected.
 const serviceProtocolVersion = 1
 
-// Machine-readable error prefixes for the spike handshake (PC-110 replaces
-// this with the typed error code contract).
+// Machine-readable error prefixes carried in ResponseEnvelope.message. The
+// envelope code (service_envelope_windows.go) classifies the failure for the
+// wire; the prefix names the exact contract a client can grep for.
 const (
-	errNoHandshake      = "ERR_NO_HANDSHAKE"
-	errProtocolVersion  = "ERR_PROTOCOL_VERSION"
-	errInvalidRequest   = "ERR_INVALID_REQUEST"
-	errMethodNotAllowed = "ERR_METHOD_NOT_ALLOWED"
+	errNoHandshake         = "ERR_NO_HANDSHAKE"
+	errProtocolVersion     = "ERR_PROTOCOL_VERSION"
+	errInvalidRequest      = "ERR_INVALID_REQUEST"
+	errMethodNotAllowed    = "ERR_METHOD_NOT_ALLOWED"
+	errFrameTooLarge       = "ERR_FRAME_TOO_LARGE"
+	errDeadlineExceeded    = "ERR_DEADLINE_EXCEEDED"
+	errStalePolicyRevision = "ERR_STALE_POLICY_REVISION"
+	errDuplicateRequest    = "ERR_DUPLICATE_REQUEST"
 )
 
-// serviceMethodAllowlist is the ONLY method table a service-mode client can
-// reach after the handshake. It deliberately does NOT fall back to the legacy
-// handlers map: that table carries privileged utility RPC (SetSystemDNS,
-// InstallDashboard, CloseConnections, ...) and, via Start, the extra-process
-// execution surface — none of which a service client may drive. Remediation
-// of the PC-100 review P0.
-var serviceMethodAllowlist = map[string]handlerFn{
-	"Hello":       handle(globalServer.Hello),
-	"Health":      handle(globalServer.Health),
-	"CheckConfig": handle(globalServer.ServiceCheckConfig),
-	"Start":       handle(globalServer.ServiceStart),
-	"Stop":        handle(globalServer.Stop),
-}
-
-// dispatchService serves a service-mode client from the allowlist only. Every
-// other method — known to the legacy table or not — gets the same stable
-// typed error, and the legacy GUI-child dispatch is untouched.
-func dispatchService(method string, payload []byte) ([]byte, error) {
-	h, found := serviceMethodAllowlist[method]
-	if !found {
-		return nil, fmt.Errorf("%s: %q is not available in service mode", errMethodNotAllowed, method)
-	}
-	return h(context.Background(), payload)
-}
+// The service method table is serviceOperations (service_envelope_windows.go,
+// PC-110): the single registry that maps an envelope operation to a typed
+// handler. It carries exactly Hello, Health, CheckConfig, Start and Stop and
+// deliberately does NOT fall back to the legacy handlers map — that table
+// carries privileged utility RPC (SetSystemDNS, InstallDashboard,
+// CloseConnections, ...) and, via raw Start, the extra-process execution
+// surface, none of which a service client may drive. The PC-100 spike's
+// separate serviceMethodAllowlist was folded into the registry so exactly one
+// table decides what a service client may call.
 
 func servicePipeName() string {
 	if v := os.Getenv("THRONE_SERVICE_PIPE"); v != "" {
@@ -504,116 +496,22 @@ func (h *proxyCoreServiceHandler) Execute(args []string, r <-chan svc.ChangeRequ
 	}
 }
 
-type serviceRequest struct {
-	id            uint32
-	method        string
-	payload       []byte
-	payloadWeight int64
-}
+// The service wire framing (PC-110) lives in service_envelope_windows.go:
+// readServiceEnvelope parses [u32 frameLen][RequestEnvelope] and
+// writeServiceEnvelopeResponse writes [u32 frameLen][ResponseEnvelope]. The
+// legacy GUI-child frame layout stays in dispatch.go only — the two protocols
+// share no code, so neither can drift into the other.
 
-// readServiceRequest parses the same little-endian frame layout as
-// runDispatch: [u32 reqId][u16 methodLen][method][u32 payloadLen][payload].
-// Duplicated on purpose so dispatch.go stays untouched (ADR-002); PC-110
-// replaces both with the versioned envelope reader.
-func readServiceRequest(ctx context.Context, conn net.Conn, allowIdle bool) (serviceRequest, error) {
-	var req serviceRequest
-	if !allowIdle {
-		if err := conn.SetReadDeadline(time.Now().Add(serviceReadTimeout)); err != nil {
-			return req, err
-		}
-	}
-	var head [4]byte
-	if allowIdle {
-		// Established clients may remain idle indefinitely. The first byte starts
-		// a frame; the rest must then arrive before the deadline.
-		if _, err := io.ReadFull(conn, head[:1]); err != nil {
-			return req, err
-		}
-	}
-	if err := conn.SetReadDeadline(time.Now().Add(serviceReadTimeout)); err != nil {
-		return req, err
-	}
-	defer conn.SetReadDeadline(time.Time{}) //nolint:errcheck -- a later I/O reports connection errors
-	if allowIdle {
-		if _, err := io.ReadFull(conn, head[1:]); err != nil {
-			return req, err
-		}
-	} else if _, err := io.ReadFull(conn, head[:]); err != nil {
-		return req, err
-	}
-	req.id = binary.LittleEndian.Uint32(head[:])
-
-	var methodLenBytes [2]byte
-	if _, err := io.ReadFull(conn, methodLenBytes[:]); err != nil {
-		return req, err
-	}
-	methodLen := binary.LittleEndian.Uint16(methodLenBytes[:])
-	if methodLen == 0 || methodLen > serviceMaxMethodLen {
-		return req, fmt.Errorf("%s: method length %d out of range", errInvalidRequest, methodLen)
-	}
-	method := make([]byte, methodLen)
-	if _, err := io.ReadFull(conn, method); err != nil {
-		return req, err
-	}
-	req.method = string(method)
-
-	var payloadLenBytes [4]byte
-	if _, err := io.ReadFull(conn, payloadLenBytes[:]); err != nil {
-		return req, err
-	}
-	payloadLen := binary.LittleEndian.Uint32(payloadLenBytes[:])
-	if payloadLen > serviceMaxPayloadLen {
-		return req, fmt.Errorf("%s: payload too large: %d", errInvalidRequest, payloadLen)
-	}
-	if payloadLen > 0 {
-		if err := servicePayloadSlots.Acquire(ctx, int64(payloadLen)); err != nil {
-			return req, err
-		}
-		req.payloadWeight = int64(payloadLen)
-	}
-	payload := make([]byte, payloadLen)
-	if _, err := io.ReadFull(conn, payload); err != nil {
-		releaseServicePayload(&req)
-		return req, err
-	}
-	req.payload = payload
-	return req, nil
-}
-
-func releaseServicePayload(req *serviceRequest) {
-	if req.payloadWeight > 0 {
-		servicePayloadSlots.Release(req.payloadWeight)
-		req.payloadWeight = 0
-	}
-}
-
-// writeServiceResponse mirrors runDispatch's response framing. mu is optional
-// (nil for the handshake phase, which is single-threaded per connection).
-func writeServiceResponse(mu *sync.Mutex, conn net.Conn, reqId uint32, status uint8, data []byte) error {
-	var header [9]byte
-	binary.LittleEndian.PutUint32(header[0:], reqId)
-	header[4] = status
-	binary.LittleEndian.PutUint32(header[5:], uint32(len(data)))
-	if mu != nil {
-		mu.Lock()
-		defer mu.Unlock()
-	}
-	if err := conn.SetWriteDeadline(time.Now().Add(serviceWriteTimeout)); err != nil {
-		return err
-	}
-	defer conn.SetWriteDeadline(time.Time{}) //nolint:errcheck -- a later I/O reports connection errors
-	if _, err := conn.Write(header[:]); err != nil {
-		return err
-	}
-	if len(data) > 0 {
-		_, err := conn.Write(data)
-		return err
-	}
-	return nil
-}
-
-// serveServiceConn handles one client connection. A disconnect is a normal
-// service-mode event: unlike runDispatch, it never terminates the process.
+// serveServiceConn handles one client connection with the PC-110 envelope
+// protocol. A disconnect is a normal service-mode event: unlike runDispatch,
+// it never terminates the process.
+//
+// Every request is validated as a whole before anything dispatches:
+// protocol version → shutdown gate → handshake state → request id → deadline
+// → expected config-policy revision → operation registry → typed payload.
+// Requests the serve loop itself refuses (unknown operation, wrong payload,
+// stale revision, expired deadline, duplicate id) never reach a handler and
+// never break the connection, so the client can correct and continue.
 func serveServiceConn(conn net.Conn) {
 	serveServiceConnContext(context.Background(), conn)
 }
@@ -621,26 +519,52 @@ func serveServiceConn(conn net.Conn) {
 func serveServiceConnContext(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 
-	// Mandatory versioned handshake before any other method.
-	req, err := readServiceRequest(ctx, conn, false)
+	var writeMu sync.Mutex
+	respond := func(reqID uint64, code int32, msg string, payload []byte) error {
+		return writeServiceEnvelopeResponse(&writeMu, conn, &gen.ResponseEnvelope{
+			RequestId:              To(reqID),
+			Code:                   To(code),
+			Message:                To(msg),
+			TypedPayload:           payload,
+			ServiceProtocolVersion: To(int32(serviceProtocolVersion)),
+		})
+	}
+	// answer releases the frame and replies with a serve-loop refusal; it
+	// reports whether the connection is still usable for the next frame.
+	answer := func(frame *serviceEnvelopeFrame, reqID uint64, code int32, msg string) bool {
+		releaseServiceEnvelope(frame)
+		return respond(reqID, code, msg, nil) == nil
+	}
+
+	ids := newServiceRequestIDs()
+
+	// Mandatory versioned handshake: the first envelope must be Hello and
+	// carry the protocol version the service speaks.
+	first, err := readServiceEnvelope(ctx, conn, false)
 	if err != nil {
+		var protoErr *envelopeProtocolError
+		if errors.As(err, &protoErr) {
+			_ = respond(0, protoErr.code, protoErr.msg, nil)
+		}
 		return
 	}
-	defer releaseServicePayload(&req)
-	if req.method != "Hello" {
-		_ = writeServiceResponse(nil, conn, req.id, 1,
-			[]byte(fmt.Sprintf("%s: first request must be Hello", errNoHandshake)))
+	defer releaseServiceEnvelope(&first)
+	env := first.env
+	if env.GetProtocolVersion() != serviceProtocolVersion {
+		// An incompatible client is told why and disconnected.
+		_ = respond(env.GetRequestId(), envelopeCodeIncompatibleVersion,
+			fmt.Sprintf("%s: client %d, service %d", errProtocolVersion, env.GetProtocolVersion(), serviceProtocolVersion), nil)
 		return
 	}
-	var hs gen.HandshakeReq
-	if err := proto.Unmarshal(req.payload, &hs); err != nil {
-		_ = writeServiceResponse(nil, conn, req.id, 1,
-			[]byte(fmt.Sprintf("%s: %v", errInvalidRequest, err)))
+	if env.GetOperation() != "Hello" {
+		answer(&first, env.GetRequestId(), envelopeCodeInvalidRequest,
+			fmt.Sprintf("%s: first request must be the Hello operation", errNoHandshake))
 		return
 	}
-	if hs.GetProtocolVersion() != serviceProtocolVersion {
-		_ = writeServiceResponse(nil, conn, req.id, 1,
-			[]byte(fmt.Sprintf("%s: client %d, service %d", errProtocolVersion, hs.GetProtocolVersion(), serviceProtocolVersion)))
+	opHello := serviceOperations["Hello"]
+	if _, decodeErr := opHello.decode(env.GetTypedPayload()); decodeErr != nil {
+		answer(&first, env.GetRequestId(), envelopeCodeInvalidRequest,
+			fmt.Sprintf("%s: Hello payload: %v", errInvalidRequest, decodeErr))
 		return
 	}
 	hsResp, err := proto.Marshal(&gen.HandshakeResp{
@@ -650,61 +574,164 @@ func serveServiceConnContext(ctx context.Context, conn net.Conn) {
 	if err != nil {
 		return
 	}
-	if err := writeServiceResponse(nil, conn, req.id, 0, hsResp); err != nil {
+	if err := respond(env.GetRequestId(), envelopeCodeOK, "", hsResp); err != nil {
 		return
 	}
-	releaseServicePayload(&req)
+	releaseServiceEnvelope(&first)
 
-	var writeMu sync.Mutex
-	sem := make(chan struct{}, serviceHandlerConcurrencyPerConn)
+	handlerSem := make(chan struct{}, serviceHandlerConcurrencyPerConn)
 	for {
-		req, err := readServiceRequest(ctx, conn, true)
+		frame, err := readServiceEnvelope(ctx, conn, true)
 		if err != nil {
-			// Client went away or sent garbage: close and move on.
+			var protoErr *envelopeProtocolError
+			if errors.As(err, &protoErr) {
+				_ = respond(0, protoErr.code, protoErr.msg, nil)
+				if !protoErr.closeConn {
+					continue
+				}
+			}
+			// Client went away, sent an unparsable stream, or the service is
+			// shutting down: close and move on.
 			return
 		}
-		if req.method == "Hello" {
-			_ = writeServiceResponse(&writeMu, conn, req.id, 1,
-				[]byte(fmt.Sprintf("%s: handshake already complete", errInvalidRequest)))
-			releaseServicePayload(&req)
+		env := frame.env
+		reqID := env.GetRequestId()
+
+		if env.GetProtocolVersion() != serviceProtocolVersion {
+			// A client that suddenly speaks another version is incompatible;
+			// answer and disconnect.
+			answer(&frame, reqID, envelopeCodeIncompatibleVersion,
+				fmt.Sprintf("%s: client %d, service %d", errProtocolVersion, env.GetProtocolVersion(), serviceProtocolVersion))
+			return
+		}
+
+		// Shutdown refuses new work: nothing that arrives from here on
+		// reaches a handler.
+		if ctx.Err() != nil {
+			answer(&frame, reqID, envelopeCodeServiceUnavailable, "service is shutting down")
+			return
+		}
+
+		if env.GetOperation() == "Hello" {
+			if !answer(&frame, reqID, envelopeCodeInvalidRequest,
+				fmt.Sprintf("%s: handshake already complete", errNoHandshake)) {
+				return
+			}
 			continue
 		}
+
+		if reqID == 0 {
+			// request_id is the dedup and correlation key; 0 is its absence.
+			if !answer(&frame, 0, envelopeCodeInvalidRequest,
+				fmt.Sprintf("%s: request_id is required", errInvalidRequest)) {
+				return
+			}
+			continue
+		}
+
+		if ms := env.GetDeadlineUnixMs(); ms > 0 && !time.Now().Before(time.UnixMilli(ms)) {
+			if !answer(&frame, reqID, envelopeCodeDeadlineExceeded,
+				fmt.Sprintf("%s: deadline %d already passed", errDeadlineExceeded, ms)) {
+				return
+			}
+			continue
+		}
+
+		if rev := env.GetExpectedPolicyRevision(); rev != 0 && rev != configPolicyRevision {
+			if !answer(&frame, reqID, envelopeCodeStalePolicyRevision,
+				fmt.Sprintf("%s: client expects config policy revision %d, service runs %d", errStalePolicyRevision, rev, configPolicyRevision)) {
+				return
+			}
+			continue
+		}
+
+		op, found := serviceOperations[env.GetOperation()]
+		if !found {
+			// Everything outside the registry — known to the legacy table or
+			// not — gets the same stable typed refusal, and the connection
+			// stays usable.
+			if !answer(&frame, reqID, envelopeCodeInvalidRequest,
+				fmt.Sprintf("%s: %q is not available in service mode", errMethodNotAllowed, env.GetOperation())) {
+				return
+			}
+			continue
+		}
+
+		reqMsg, decodeErr := op.decode(env.GetTypedPayload())
+		if decodeErr != nil {
+			if !answer(&frame, reqID, envelopeCodeInvalidRequest,
+				fmt.Sprintf("%s: %s payload: %v", errInvalidRequest, op.name, decodeErr)) {
+				return
+			}
+			continue
+		}
+
+		// The id is recorded only when the request is accepted for execution,
+		// so a client can retry a refused request with the same id.
+		if !ids.tryAdd(reqID) {
+			if !answer(&frame, reqID, envelopeCodeDuplicateRequest,
+				fmt.Sprintf("%s: request id %d was already executed on this connection", errDuplicateRequest, reqID)) {
+				return
+			}
+			continue
+		}
+
+		// Handler concurrency is bounded both per connection and across the
+		// service; both waits abort on shutdown without spawning a handler.
 		serviceHandlersWG.Add(1)
 		select {
 		case serviceHandlerSlots <- struct{}{}:
 		case <-ctx.Done():
 			serviceHandlersWG.Done()
-			releaseServicePayload(&req)
+			answer(&frame, reqID, envelopeCodeServiceUnavailable, "service is shutting down")
 			return
 		}
 		select {
-		case sem <- struct{}{}:
+		case handlerSem <- struct{}{}:
 		case <-ctx.Done():
 			<-serviceHandlerSlots
 			serviceHandlersWG.Done()
-			releaseServicePayload(&req)
+			answer(&frame, reqID, envelopeCodeServiceUnavailable, "service is shutting down")
 			return
 		}
-		go func(request serviceRequest) {
+
+		// The payload budget travels with the handler so the aggregate
+		// in-flight envelope memory stays bounded for the handler's lifetime.
+		weight := frame.weight
+		frame.weight = 0
+		hctx, cancel := envelopeContext(ctx, env)
+		go func(requestID uint64, op serviceOperationDef, msg proto.Message) {
 			defer serviceHandlersWG.Done()
-			defer func() { <-sem }()
+			defer cancel()
+			defer func() { <-handlerSem }()
 			defer func() { <-serviceHandlerSlots }()
-			defer releaseServicePayload(&request)
+			defer func() { servicePayloadSlots.Release(weight) }()
 			defer func() {
 				if r := recover(); r != nil {
 					// Same stack parity as runDispatch: a panic must be diagnosable.
-					log.Printf("panic in %s: %v\n%s", request.method, r, runtimeDebug.Stack())
-					_ = writeServiceResponse(&writeMu, conn, request.id, 1,
-						[]byte(fmt.Sprintf("core panic in %s: %v", request.method, r)))
+					log.Printf("panic in %s: %v\n%s", op.name, r, runtimeDebug.Stack())
+					_ = respond(requestID, envelopeCodeRuntimeFailure,
+						fmt.Sprintf("core panic in %s: %v", op.name, r), nil)
 				}
 			}()
-			respData, dispatchErr := dispatchService(request.method, request.payload)
-			if dispatchErr != nil {
-				_ = writeServiceResponse(&writeMu, conn, request.id, 1, []byte(dispatchErr.Error()))
-			} else {
-				_ = writeServiceResponse(&writeMu, conn, request.id, 0, respData)
+			if ctx.Err() != nil {
+				// Shutdown won the race with the spawn; run nothing.
+				_ = respond(requestID, envelopeCodeServiceUnavailable, "service is shutting down", nil)
+				return
 			}
-		}(req)
+			respMsg, callErr := op.call(hctx, msg)
+			if callErr != nil {
+				_ = respond(requestID, envelopeCodeForHandlerError(callErr), callErr.Error(), nil)
+				return
+			}
+			respBytes, marshalErr := proto.Marshal(respMsg)
+			if marshalErr != nil {
+				_ = respond(requestID, envelopeCodeRuntimeFailure,
+					fmt.Sprintf("%s: %s response: %v", errInvalidRequest, op.name, marshalErr), nil)
+				return
+			}
+			_ = respond(requestID, envelopeCodeOK, "", respBytes)
+		}(reqID, op, reqMsg)
 	}
 }
 

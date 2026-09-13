@@ -293,16 +293,16 @@ func TestServiceWirePolicyEndToEnd(t *testing.T) {
 	for i, c := range cycles {
 		cfg := `{"log":{"level":"warn"},"experimental":{"cache_file":{"enabled":true,"path":` +
 			quoteJSONString(t, c.clientPath) + `}},"inbounds":[],"outbounds":[]}`
-		status, data := wireCall(t, conn, uint32(100+i), "Start", mustMarshal(t, &gen.LoadConfigReq{
+		resp := envCall(t, conn, uint64(100+i), "Start", mustMarshal(t, &gen.LoadConfigReq{
 			CoreConfig:       proto.String(cfg),
 			NeedExtraProcess: proto.Bool(false),
 			NeedXray:         proto.Bool(false),
 		}))
-		if status != 0 {
-			t.Fatalf("%s: Start with a hostile cache path must be accepted (it is rewritten), got status=%d data=%q", c.name, status, string(data))
+		if resp.GetCode() != envelopeCodeOK {
+			t.Fatalf("%s: Start with a hostile cache path must be accepted (it is rewritten), got code=%d message=%q", c.name, resp.GetCode(), resp.GetMessage())
 		}
 		startResp := &gen.ErrorResp{}
-		if err := proto.Unmarshal(data, startResp); err != nil {
+		if err := proto.Unmarshal(resp.GetTypedPayload(), startResp); err != nil {
 			t.Fatal(err)
 		}
 		if startResp.GetError() != "" {
@@ -311,9 +311,9 @@ func TestServiceWirePolicyEndToEnd(t *testing.T) {
 
 		waitForFile(t, filepath.Join(dataDir, "cache.db"), 10*time.Second)
 
-		status, data = wireCall(t, conn, uint32(200+i), "Stop", mustMarshal(t, &gen.EmptyReq{}))
-		if status != 0 {
-			t.Fatalf("%s: Stop failed: status=%d data=%q", c.name, status, string(data))
+		resp = envCall(t, conn, uint64(200+i), "Stop", mustMarshal(t, &gen.EmptyReq{}))
+		if resp.GetCode() != envelopeCodeOK {
+			t.Fatalf("%s: Stop failed: code=%d message=%q", c.name, resp.GetCode(), resp.GetMessage())
 		}
 	}
 
@@ -342,25 +342,25 @@ func TestServiceWirePolicyEndToEnd(t *testing.T) {
 		}
 	}
 
-	// Policy rejections over the wire, through BOTH Start and CheckConfig
+	// Policy refusals over the wire, through BOTH Start and CheckConfig
 	// (what one rejects, the other must reject — wire parity).
 	policyDoc := `{"log":{"output":"C:\\Windows\\Temp\\evil.log"}}`
 	for i, method := range []string{"Start", "CheckConfig"} {
-		status, data := wireCall(t, conn, uint32(300+i), method, mustMarshal(t, &gen.LoadConfigReq{CoreConfig: proto.String(policyDoc)}))
-		if status != 1 || !strings.HasPrefix(string(data), errConfigPolicy) {
-			t.Fatalf("%s: want %s typed wire rejection, got status=%d data=%q", method, errConfigPolicy, status, string(data))
+		resp := envCall(t, conn, uint64(300+i), method, mustMarshal(t, &gen.LoadConfigReq{CoreConfig: proto.String(policyDoc)}))
+		if resp.GetCode() != envelopeCodeInvalidRequest || !strings.HasPrefix(resp.GetMessage(), errConfigPolicy) {
+			t.Fatalf("%s: want %s typed wire refusal, got code=%d message=%q", method, errConfigPolicy, resp.GetCode(), resp.GetMessage())
 		}
 	}
 	if currentBox() != nil {
-		t.Fatal("rejections must not have started a runtime")
+		t.Fatal("refusals must not have started a runtime")
 	}
 
 	// CheckConfig must accept the same normalized document Start accepts
 	// (parity in the accepting direction, including the data-dir contract).
 	cfg := `{"log":{"level":"warn"},"experimental":{"cache_file":{"enabled":true}},"inbounds":[],"outbounds":[]}`
-	status, data := wireCall(t, conn, 310, "CheckConfig", mustMarshal(t, &gen.LoadConfigReq{CoreConfig: proto.String(cfg)}))
-	if status != 0 {
-		t.Fatalf("CheckConfig must accept a normalizable config, got status=%d data=%q", status, string(data))
+	resp := envCall(t, conn, 310, "CheckConfig", mustMarshal(t, &gen.LoadConfigReq{CoreConfig: proto.String(cfg)}))
+	if resp.GetCode() != envelopeCodeOK {
+		t.Fatalf("CheckConfig must accept a normalizable config, got code=%d message=%q", resp.GetCode(), resp.GetMessage())
 	}
 }
 
@@ -596,7 +596,7 @@ func TestServiceClientIdentityRealPipe(t *testing.T) {
 	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatalf("SetReadDeadline: %v", err)
 	}
-	if _, _, _, err := tryReadResponse(conn); err == nil {
+	if _, err := tryReadEnvelope(conn); err == nil {
 		t.Fatal("a DACL-admitted client with an empty allowlist must be denied by token identity")
 	} else if errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatal("the service neither served nor denied the client within 5s")
@@ -604,23 +604,22 @@ func TestServiceClientIdentityRealPipe(t *testing.T) {
 	_ = conn.Close()
 }
 
-// tryReadResponse reads a service response without failing the test; used
+// tryReadEnvelope reads a service response without failing the test; used
 // where an error (EOF after a server-side close) IS the expected outcome.
-func tryReadResponse(r io.Reader) (uint32, uint8, []byte, error) {
-	var head [9]byte
-	if _, err := io.ReadFull(r, head[:]); err != nil {
-		return 0, 0, nil, err
+func tryReadEnvelope(r io.Reader) (*gen.ResponseEnvelope, error) {
+	var lenBytes [4]byte
+	if _, err := io.ReadFull(r, lenBytes[:]); err != nil {
+		return nil, err
 	}
-	id := binary.LittleEndian.Uint32(head[0:4])
-	status := head[4]
-	dataLen := binary.LittleEndian.Uint32(head[5:9])
-	data := make([]byte, dataLen)
-	if dataLen > 0 {
-		if _, err := io.ReadFull(r, data); err != nil {
-			return 0, 0, nil, err
-		}
+	body := make([]byte, binary.LittleEndian.Uint32(lenBytes[:]))
+	if _, err := io.ReadFull(r, body); err != nil {
+		return nil, err
 	}
-	return id, status, data, nil
+	resp := &gen.ResponseEnvelope{}
+	if err := proto.Unmarshal(body, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 // ---- remediation round 3: parser semantics ----
@@ -731,9 +730,9 @@ func TestServiceWireRejectsJSONCDocuments(t *testing.T) {
 		},
 	}
 	for i, c := range cases {
-		status, data := wireCall(t, conn, uint32(500+i), c.method, mustMarshal(t, c.payload))
-		if status != 1 || !strings.HasPrefix(string(data), errConfigPolicy) {
-			t.Fatalf("%s: JSONC document must fail closed with %s, got status=%d data=%q", c.name, errConfigPolicy, status, string(data))
+		resp := envCall(t, conn, uint64(500+i), c.method, mustMarshal(t, c.payload))
+		if resp.GetCode() != envelopeCodeInvalidRequest || !strings.HasPrefix(resp.GetMessage(), errConfigPolicy) {
+			t.Fatalf("%s: JSONC document must fail closed with %s, got code=%d message=%q", c.name, errConfigPolicy, resp.GetCode(), resp.GetMessage())
 		}
 	}
 
@@ -785,13 +784,13 @@ func TestServiceConfigPolicyCaseVariantKeys(t *testing.T) {
 	mustHandshake(t, conn)
 	doc := `{"LOG":{"OUTPUT":` + quoteJSONString(t, logSink) + `}}`
 	for i, method := range []string{"Start", "CheckConfig"} {
-		status, data := wireCall(t, conn, uint32(510+i), method, mustMarshal(t, &gen.LoadConfigReq{
+		resp := envCall(t, conn, uint64(510+i), method, mustMarshal(t, &gen.LoadConfigReq{
 			NeedExtraProcess: proto.Bool(false),
 			NeedXray:         proto.Bool(false),
 			CoreConfig:       proto.String(doc),
 		}))
-		if status != 1 || !strings.HasPrefix(string(data), errConfigPolicy) {
-			t.Fatalf("%s: case-variant LOG.OUTPUT must fail closed with %s, got status=%d data=%q", method, errConfigPolicy, status, string(data))
+		if resp.GetCode() != envelopeCodeInvalidRequest || !strings.HasPrefix(resp.GetMessage(), errConfigPolicy) {
+			t.Fatalf("%s: case-variant LOG.OUTPUT must fail closed with %s, got code=%d message=%q", method, errConfigPolicy, resp.GetCode(), resp.GetMessage())
 		}
 	}
 	assertAbsent(t, logSink)
@@ -871,9 +870,9 @@ func TestServiceWireXrayFullConfigsParity(t *testing.T) {
 			CoreConfig:      proto.String(`{"inbounds":[],"outbounds":[]}`),
 			XrayFullConfigs: []string{`{"log":{"loglevel":"warning"}}`, hostile},
 		}
-		status, data := wireCall(t, conn, uint32(520+i), method, mustMarshal(t, req))
-		if status != 1 || !strings.HasPrefix(string(data), errConfigPolicy) {
-			t.Fatalf("%s: an xray_full_configs entry with a deny key must fail closed with %s, got status=%d data=%q", method, errConfigPolicy, status, string(data))
+		resp := envCall(t, conn, uint64(520+i), method, mustMarshal(t, req))
+		if resp.GetCode() != envelopeCodeInvalidRequest || !strings.HasPrefix(resp.GetMessage(), errConfigPolicy) {
+			t.Fatalf("%s: an xray_full_configs entry with a deny key must fail closed with %s, got code=%d message=%q", method, errConfigPolicy, resp.GetCode(), resp.GetMessage())
 		}
 	}
 	if currentBox() != nil {

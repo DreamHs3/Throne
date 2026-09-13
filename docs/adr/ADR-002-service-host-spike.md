@@ -208,3 +208,62 @@ split по `(A;` + trustee — последнее поле ACE), и паника
 что он прочесть не может, — «умнее» рантайм-парсера она быть больше не
 пытается. Статус PC-100 не меняется: **BLOCKED** (VM-evidence). Замена
 string-контракта typed-параметрами остаётся за PC-110.
+
+## Addendum №4 (PC-110 — versioned typed envelope на service pipe)
+
+PC-110 заменяет ad-hoc framing service-пути на версионированный typed
+envelope. Legacy GUI-child (`runDispatch`, dispatch.go, parentcheck, ipc/*)
+не изменён вообще: envelope живёт только на service pipe, общего кода у двух
+протоколов нет (кадры читает `service_envelope_windows.go`, dispatch.go не
+тронут), поэтому дрейф одного в другой исключён по построению.
+
+**Wire contract** (только service pipe, протокол версии 1):
+
+- запрос: `[u32 frameLen LE][RequestEnvelope]`, ответ:
+  `[u32 frameLen LE][ResponseEnvelope]` (оба сообщения — аддитивные,
+  protobuf; `frameLen` проверяется против `serviceMaxEnvelopeLen` (32 МиБ)
+  ДО выделения буфера; глобальный бюджет payload-памяти (64 МиБ semaphore)
+  берётся на размер кадра и держится до завершения handler'а);
+- `RequestEnvelope.protocol_version` обязателен и проверяется ДО всего
+  dispatch'а (отсутствие/несовпадение → typed `code=1` + disconnect);
+- `request_id` (uint64) обязателен (0 = отсутствие → `code=3`), дословно
+  возвращается в ответе и дедуплицируется в рамках соединения (окно 4096 id;
+  повтор → `code=9`; id записывается только для исполненных запросов —
+  отклонённый запрос можно повторить с тем же id);
+- `deadline_unix_ms`: истёкший → `code=5` до dispatch; живой ограничивает
+  контекст handler'а (deadline внутри handler'а → `code=5`);
+- `expected_policy_revision` ≠ 0 и ≠ текущей ревизии config-политики →
+  `code=6` (stale) с указанием текущей ревизии, без dispatch (`configPolicyRevision`
+  в service_config_policy.go = 1; бампится при изменении семантики политики);
+- операция резолвится ТОЛЬКО через единый реестр `serviceOperations`
+  (Hello, Health, CheckConfig, Start, Stop) — PC-100's serviceMethodAllowlist
+  упразднён, второй таблицы нет; вне реестра → `code=3` с префиксом
+  `ERR_METHOD_NOT_ALLOWED`, соединение сохраняется;
+- `typed_payload` декодируется в конкретный тип операции СТРОГО: protobuf
+  молча уводит чужие/новые поля в unknown — такой остаток отклоняется
+  (`code=3`), т.е. операция принимает только объявленные ею поля;
+- shutdown отказывает всем новым запросам `code=7` и не запускает новые
+  handlers (проверка до spawn, оба ожидания слотов прерываемы по ctx);
+- handler-ошибки классифицируются: намеренные typed-отказы (`ERR_*` префиксы)
+  → `code=3`, deadline → `code=5`, остальное/panic → `code=8`; конкретный
+  префикс всегда в `message`.
+
+`code=2` (unauthorized) зарезервирован: отказ по identity происходит на
+accept (до любого envelope) — соединение закрывается без ответа, как и в
+PC-100. SDDL/SID-проверка не ослаблены. Disconnect клиента — норма; запрет
+запроса соединение не рвёт.
+
+Типизация payload'ов сделала невозможным и обход реестра «чужим типом»:
+Start с payload HandshakeReq отклоняется как unknown-field, а не диспетчеризуется.
+Start/CheckConfig сохраняют filesystem policy (реестр связывает их с
+`ServiceStart`/`ServiceCheckConfig`, не с legacy Start/CheckConfig —
+доказано тестом: реестр отклоняет hostile-документ `ERR_CONFIG_POLICY`,
+legacy-таблица принимает тот же документ). PC-100 wire-семантика сохранена:
+все прежние typed-префиксы (`ERR_CONFIG_POLICY`, `ERR_INVALID_REQUEST`,
+`ERR_METHOD_NOT_ALLOWED`, `ERR_NO_HANDSHAKE`) остались в `message`.
+
+Ограничение (осознанное, документированное): string-JSON контракт конфига
+(`core_config`/`xray_config` внутри `LoadConfigReq.typed_payload`) сохранён —
+typed-параметры конфигурации (сервис строит конфиг сам) остаются за PC-110+/
+PC-120; interim policy из аддендумов №2-3 действует без изменений. VM-статус
+PC-100 не меняется: **BLOCKED**.

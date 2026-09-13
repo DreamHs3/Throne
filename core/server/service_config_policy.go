@@ -47,6 +47,14 @@ import (
 
 const errConfigPolicy = "ERR_CONFIG_POLICY"
 
+// configPolicyRevision is the version of this contract, carried in every
+// service request's expected_policy_revision (PC-110): a client that pins a
+// revision gets the typed stale-revision answer when the service runs a
+// different one, instead of discovering the change through a shifted
+// acceptance decision. Bump when the policy's semantics change (deny list,
+// normalization, parsing contract).
+const configPolicyRevision = 1
+
 // configServiceDataDir is the only directory the normalized config may point
 // the runtime at (cache.db). Set by the service installer (PC-120); absent in
 // the spike unless a test sets it.

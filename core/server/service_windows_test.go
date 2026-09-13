@@ -1,8 +1,9 @@
 //go:build windows
 
-// PC-100 service-spike tests. Everything runs in-process (net.Pipe, direct
-// handler calls): no SCM, no named pipe on the real machine beyond the
-// listener the spike itself creates, no network, no elevation.
+// PC-100 service-spike and PC-110 envelope tests. Everything runs in-process
+// (net.Pipe, direct handler calls): no SCM, no named pipe on the real machine
+// beyond the listener the spike itself creates, no network, no elevation. The
+// wire helpers speak the PC-110 envelope framing.
 
 package main
 
@@ -11,6 +12,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -23,56 +25,85 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// ---- wire helpers (client side of the same framing) ----
+// ---- wire helpers (client side of the PC-110 envelope framing) ----
 
-func writeRequest(t *testing.T, w io.Writer, id uint32, method string, payload []byte) {
+// envFrame builds one request frame: [u32 frameLen][RequestEnvelope bytes].
+func envFrame(t *testing.T, id uint64, version int32, op string, payload []byte) []byte {
 	t.Helper()
-	var head [6]byte
-	binary.LittleEndian.PutUint32(head[0:], id)
-	binary.LittleEndian.PutUint16(head[4:], uint16(len(method)))
-	if _, err := w.Write(head[:]); err != nil {
-		t.Fatalf("write methodLen: %v", err)
+	env := &gen.RequestEnvelope{
+		ProtocolVersion: To(version),
+		RequestId:       To(id),
+		Operation:       To(op),
+		TypedPayload:    payload,
 	}
-	if _, err := w.Write([]byte(method)); err != nil {
-		t.Fatalf("write method: %v", err)
-	}
-	var pl [4]byte
-	binary.LittleEndian.PutUint32(pl[:], uint32(len(payload)))
-	if _, err := w.Write(pl[:]); err != nil {
-		t.Fatalf("write payloadLen: %v", err)
-	}
-	if len(payload) > 0 {
-		if _, err := w.Write(payload); err != nil {
-			t.Fatalf("write payload: %v", err)
-		}
-	}
-}
-
-func readResponse(t *testing.T, r io.Reader) (uint32, uint8, []byte) {
-	t.Helper()
-	var head [9]byte
-	if _, err := io.ReadFull(r, head[:]); err != nil {
-		t.Fatalf("read response header: %v", err)
-	}
-	id := binary.LittleEndian.Uint32(head[0:4])
-	status := head[4]
-	dataLen := binary.LittleEndian.Uint32(head[5:9])
-	data := make([]byte, dataLen)
-	if dataLen > 0 {
-		if _, err := io.ReadFull(r, data); err != nil {
-			t.Fatalf("read response data: %v", err)
-		}
-	}
-	return id, status, data
-}
-
-func handshakePayload(t *testing.T, version int32) []byte {
-	t.Helper()
-	b, err := proto.Marshal(&gen.HandshakeReq{ProtocolVersion: &version})
+	body, err := proto.Marshal(env)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return b
+	frame := make([]byte, 4+len(body))
+	binary.LittleEndian.PutUint32(frame[:4], uint32(len(body)))
+	copy(frame[4:], body)
+	return frame
+}
+
+func envWrite(t *testing.T, w io.Writer, frame []byte) {
+	t.Helper()
+	if _, err := w.Write(frame); err != nil {
+		t.Fatalf("write envelope frame: %v", err)
+	}
+}
+
+func envSend(t *testing.T, w io.Writer, id uint64, version int32, op string, payload []byte) {
+	t.Helper()
+	envWrite(t, w, envFrame(t, id, version, op, payload))
+}
+
+// envRead reads one response frame and decodes the ResponseEnvelope.
+func envRead(t *testing.T, r io.Reader) *gen.ResponseEnvelope {
+	t.Helper()
+	var lenBytes [4]byte
+	if _, err := io.ReadFull(r, lenBytes[:]); err != nil {
+		t.Fatalf("read response frame length: %v", err)
+	}
+	body := make([]byte, binary.LittleEndian.Uint32(lenBytes[:]))
+	if _, err := io.ReadFull(r, body); err != nil {
+		t.Fatalf("read response frame body: %v", err)
+	}
+	resp := &gen.ResponseEnvelope{}
+	if err := proto.Unmarshal(body, resp); err != nil {
+		t.Fatalf("malformed response envelope: %v", err)
+	}
+	return resp
+}
+
+// envCall sends one request and reads its answer, asserting the response
+// echoes the request id.
+func envCall(t *testing.T, conn net.Conn, id uint64, op string, payload []byte) *gen.ResponseEnvelope {
+	t.Helper()
+	envSend(t, conn, id, serviceProtocolVersion, op, payload)
+	resp := envRead(t, conn)
+	if resp.GetRequestId() != id {
+		t.Fatalf("%s: response request_id = %d, want %d", op, resp.GetRequestId(), id)
+	}
+	return resp
+}
+
+// envHello sends the handshake with the given envelope protocol version.
+func envHello(t *testing.T, conn net.Conn, version int32) *gen.ResponseEnvelope {
+	t.Helper()
+	envSend(t, conn, 1, version, "Hello", mustMarshal(t, &gen.HandshakeReq{}))
+	resp := envRead(t, conn)
+	if resp.GetRequestId() != 1 {
+		t.Fatalf("handshake response request_id = %d, want 1", resp.GetRequestId())
+	}
+	return resp
+}
+
+func mustHandshake(t *testing.T, conn net.Conn) {
+	t.Helper()
+	if resp := envHello(t, conn, serviceProtocolVersion); resp.GetCode() != envelopeCodeOK {
+		t.Fatalf("handshake failed: code=%d message=%q", resp.GetCode(), resp.GetMessage())
+	}
 }
 
 func mustMarshal(t *testing.T, msg proto.Message) []byte {
@@ -129,36 +160,45 @@ func TestServiceConnectionSetIsGloballyBounded(t *testing.T) {
 	}
 }
 
-func TestServiceFrameLimitRejectsBeforePayloadRead(t *testing.T) {
+// An oversized envelope must be refused BEFORE its body is read (and hence
+// before any body buffer is allocated): the client sends only the length
+// header and still gets the typed frame-too-large answer. The stream cannot
+// be trusted afterwards (the claimed body may follow), so the connection is
+// closed after the answer.
+func TestServiceEnvelopeLimitRejectsBeforeAllocation(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer serverConn.Close()
 	defer clientConn.Close()
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := readServiceRequest(context.Background(), serverConn, false)
+		_, err := readServiceEnvelope(context.Background(), serverConn, false)
 		errCh <- err
 	}()
 
-	var header [6]byte
-	binary.LittleEndian.PutUint16(header[4:], uint16(len("Start")))
+	var header [4]byte
+	binary.LittleEndian.PutUint32(header[:], serviceMaxEnvelopeLen+1)
 	if _, err := clientConn.Write(header[:]); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := clientConn.Write([]byte("Start")); err != nil {
-		t.Fatal(err)
-	}
-	var payloadLength [4]byte
-	binary.LittleEndian.PutUint32(payloadLength[:], serviceMaxPayloadLen+1)
-	if _, err := clientConn.Write(payloadLength[:]); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-errCh; err == nil || !strings.Contains(err.Error(), "payload too large") {
-		t.Fatalf("oversized frame must be rejected before its body is read, got %v", err)
+	select {
+	case err := <-errCh:
+		var protoErr *envelopeProtocolError
+		if !errors.As(err, &protoErr) {
+			t.Fatalf("oversized envelope must be a typed protocol error, got %v", err)
+		}
+		if protoErr.code != envelopeCodeFrameTooLarge || !protoErr.closeConn {
+			t.Fatalf("want code=%d closeConn=true, got code=%d closeConn=%v", envelopeCodeFrameTooLarge, protoErr.code, protoErr.closeConn)
+		}
+		if !strings.HasPrefix(protoErr.msg, errFrameTooLarge) {
+			t.Fatalf("typed prefix missing: %q", protoErr.msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("an oversized envelope must be refused without reading its body")
 	}
 }
 
-func TestServicePartialFrameGetsDeadline(t *testing.T) {
+func TestServiceEnvelopePartialFrameGetsDeadline(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer serverConn.Close()
 	defer clientConn.Close()
@@ -169,7 +209,7 @@ func TestServicePartialFrameGetsDeadline(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := readServiceRequest(context.Background(), serverConn, true)
+		_, err := readServiceEnvelope(context.Background(), serverConn, true)
 		errCh <- err
 	}()
 	if _, err := clientConn.Write([]byte{1}); err != nil {
@@ -233,24 +273,17 @@ func serveOverPipe(t *testing.T) (client net.Conn, done <-chan struct{}) {
 	return clientConn, finished
 }
 
-func doHandshake(t *testing.T, conn net.Conn, version int32) (uint8, []byte) {
-	t.Helper()
-	writeRequest(t, conn, 1, "Hello", handshakePayload(t, version))
-	id, status, data := readResponse(t, conn)
-	if id != 1 {
-		t.Fatalf("handshake response id = %d, want 1", id)
-	}
-	return status, data
-}
-
 func TestServiceHandshakeVersionMismatchTypedError(t *testing.T) {
 	conn, finished := serveOverPipe(t)
-	status, data := doHandshake(t, conn, serviceProtocolVersion+99)
-	if status != 1 {
-		t.Fatalf("version mismatch must yield status=1, got %d", status)
+	resp := envHello(t, conn, serviceProtocolVersion+99)
+	if resp.GetCode() != envelopeCodeIncompatibleVersion {
+		t.Fatalf("version mismatch must yield code=%d, got %d", envelopeCodeIncompatibleVersion, resp.GetCode())
 	}
-	if !strings.HasPrefix(string(data), errProtocolVersion) {
-		t.Fatalf("typed error prefix missing: %q", string(data))
+	if !strings.HasPrefix(resp.GetMessage(), errProtocolVersion) {
+		t.Fatalf("typed error prefix missing: %q", resp.GetMessage())
+	}
+	if resp.GetServiceProtocolVersion() != serviceProtocolVersion {
+		t.Fatalf("response service_protocol_version = %d, want %d", resp.GetServiceProtocolVersion(), serviceProtocolVersion)
 	}
 	// Incompatible clients are disconnected after the typed error.
 	select {
@@ -260,12 +293,28 @@ func TestServiceHandshakeVersionMismatchTypedError(t *testing.T) {
 	}
 }
 
+// protocol_version is mandatory: an envelope that omits it is incompatible
+// with every protocol version and gets the same typed refusal.
+func TestServiceHandshakeMissingVersionTypedError(t *testing.T) {
+	conn, finished := serveOverPipe(t)
+	envWrite(t, conn, envFrame(t, 1, 0, "Hello", nil))
+	resp := envRead(t, conn)
+	if resp.GetCode() != envelopeCodeIncompatibleVersion || !strings.HasPrefix(resp.GetMessage(), errProtocolVersion) {
+		t.Fatalf("missing version must yield %s code=%d, got code=%d message=%q", errProtocolVersion, envelopeCodeIncompatibleVersion, resp.GetCode(), resp.GetMessage())
+	}
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server must close the connection without a protocol version")
+	}
+}
+
 func TestServiceFirstRequestMustBeHandshake(t *testing.T) {
 	conn, finished := serveOverPipe(t)
-	writeRequest(t, conn, 7, "Health", nil)
-	_, status, data := readResponse(t, conn)
-	if status != 1 || !strings.HasPrefix(string(data), errNoHandshake) {
-		t.Fatalf("want %s typed error, got status=%d data=%q", errNoHandshake, status, string(data))
+	envSend(t, conn, 7, serviceProtocolVersion, "Health", nil)
+	resp := envRead(t, conn)
+	if resp.GetCode() != envelopeCodeInvalidRequest || !strings.HasPrefix(resp.GetMessage(), errNoHandshake) {
+		t.Fatalf("want %s code=%d, got code=%d message=%q", errNoHandshake, envelopeCodeInvalidRequest, resp.GetCode(), resp.GetMessage())
 	}
 	select {
 	case <-finished:
@@ -279,23 +328,18 @@ func TestServiceFirstRequestMustBeHandshake(t *testing.T) {
 // subsequent client can connect and work again.
 func TestServiceSurvivesClientDisconnectWithoutGUI(t *testing.T) {
 	connA, _ := serveOverPipe(t)
-	if status, _ := doHandshake(t, connA, serviceProtocolVersion); status != 0 {
-		t.Fatalf("first handshake failed: status=%d", status)
-	}
+	mustHandshake(t, connA)
 	_ = connA.Close()
 
 	connB, _ := serveOverPipe(t)
-	if status, _ := doHandshake(t, connB, serviceProtocolVersion); status != 0 {
-		t.Fatalf("handshake after a disconnect failed: status=%d", status)
-	}
+	mustHandshake(t, connB)
 	// Health works after reconnection; no runtime was started by anyone.
-	writeRequest(t, connB, 2, "Health", nil)
-	_, status, data := readResponse(t, connB)
-	if status != 0 {
-		t.Fatalf("Health failed: status=%d data=%q", status, string(data))
+	resp := envCall(t, connB, 2, "Health", nil)
+	if resp.GetCode() != envelopeCodeOK {
+		t.Fatalf("Health failed: code=%d message=%q", resp.GetCode(), resp.GetMessage())
 	}
 	health := &gen.HealthResp{}
-	if err := proto.Unmarshal(data, health); err != nil {
+	if err := proto.Unmarshal(resp.GetTypedPayload(), health); err != nil {
 		t.Fatal(err)
 	}
 	if health.GetRuntimeRunning() {
@@ -383,48 +427,31 @@ func TestStartInvalidConfigFailsClean(t *testing.T) {
 // after a completed Hello handshake, exactly as a service client would —
 // never through a direct dispatch() call.
 
-func wireCall(t *testing.T, conn net.Conn, id uint32, method string, payload []byte) (uint8, []byte) {
-	t.Helper()
-	writeRequest(t, conn, id, method, payload)
-	gotID, status, data := readResponse(t, conn)
-	if gotID != id {
-		t.Fatalf("%s: response id = %d, want %d", method, gotID, id)
-	}
-	return status, data
-}
-
-func mustHandshake(t *testing.T, conn net.Conn) {
-	t.Helper()
-	if status, data := doHandshake(t, conn, serviceProtocolVersion); status != 0 {
-		t.Fatalf("handshake failed: status=%d data=%q", status, string(data))
-	}
-}
-
 // Privileged utility RPC that the legacy table carries must be unreachable
-// from the service wire path and must fail with the stable typed error, and
+// from the service wire path and must fail with the stable typed refusal, and
 // the connection must stay usable afterwards.
 func TestServiceWirePathRejectsPrivilegedMethods(t *testing.T) {
 	conn, _ := serveOverPipe(t)
 	mustHandshake(t, conn)
 
-	for _, method := range []string{"SetSystemDNS", "InstallDashboard", "CloseConnections", "QueryStats", "GenWgKeyPair", "DefinitelyNotAMethod"} {
-		status, data := wireCall(t, conn, 10, method, nil)
-		if status != 1 {
-			t.Fatalf("%s: want rejection status=1, got %d", method, status)
+	for i, method := range []string{"SetSystemDNS", "InstallDashboard", "CloseConnections", "QueryStats", "GenWgKeyPair", "WarpRegister", "DefinitelyNotAMethod"} {
+		resp := envCall(t, conn, uint64(10+i), method, nil)
+		if resp.GetCode() != envelopeCodeInvalidRequest {
+			t.Fatalf("%s: want code=%d, got %d (%q)", method, envelopeCodeInvalidRequest, resp.GetCode(), resp.GetMessage())
 		}
-		if !strings.HasPrefix(string(data), errMethodNotAllowed) {
-			t.Fatalf("%s: want %s typed error, got %q", method, errMethodNotAllowed, string(data))
+		if !strings.HasPrefix(resp.GetMessage(), errMethodNotAllowed) {
+			t.Fatalf("%s: want %s typed refusal, got %q", method, errMethodNotAllowed, resp.GetMessage())
 		}
 	}
 
-	// The rejection is stable and non-destructive: the same connection still
-	// serves allowlisted methods afterwards.
-	status, _ := wireCall(t, conn, 11, "Health", nil)
-	if status != 0 {
-		t.Fatalf("Health after rejections must succeed, got status=%d", status)
+	// The refusal is stable and non-destructive: the same connection still
+	// serves registry operations afterwards.
+	resp := envCall(t, conn, 11, "Health", nil)
+	if resp.GetCode() != envelopeCodeOK {
+		t.Fatalf("Health after refusals must succeed, got code=%d message=%q", resp.GetCode(), resp.GetMessage())
 	}
 	if currentBox() != nil {
-		t.Fatal("rejections must not have started a runtime")
+		t.Fatal("refusals must not have started a runtime")
 	}
 }
 
@@ -462,22 +489,22 @@ func TestServiceWireStartRejectsExtraProcess(t *testing.T) {
 		},
 	}
 	for i, c := range cases {
-		status, data := wireCall(t, conn, uint32(20+i), "Start", mustMarshal(t, c.req))
-		if status != 1 {
-			t.Fatalf("%s: want rejection status=1, got %d", c.name, status)
+		resp := envCall(t, conn, uint64(20+i), "Start", mustMarshal(t, c.req))
+		if resp.GetCode() != envelopeCodeInvalidRequest {
+			t.Fatalf("%s: want code=%d, got %d (%q)", c.name, envelopeCodeInvalidRequest, resp.GetCode(), resp.GetMessage())
 		}
-		if !strings.HasPrefix(string(data), errInvalidRequest) || !strings.Contains(string(data), "not permitted in service mode") {
-			t.Fatalf("%s: want %s typed error, got %q", c.name, errInvalidRequest, string(data))
+		if !strings.HasPrefix(resp.GetMessage(), errInvalidRequest) || !strings.Contains(resp.GetMessage(), "not permitted in service mode") {
+			t.Fatalf("%s: want %s typed refusal, got %q", c.name, errInvalidRequest, resp.GetMessage())
 		}
 		if currentBox() != nil {
-			t.Fatalf("%s: rejection must not start a runtime", c.name)
+			t.Fatalf("%s: refusal must not start a runtime", c.name)
 		}
 	}
 
 	// Stop still works on the same connection; nothing was spawned or torn down.
-	status, data := wireCall(t, conn, 30, "Stop", mustMarshal(t, &gen.EmptyReq{}))
-	if status != 0 {
-		t.Fatalf("Stop after rejections must be a clean no-op, got status=%d data=%q", status, string(data))
+	resp := envCall(t, conn, 30, "Stop", mustMarshal(t, &gen.EmptyReq{}))
+	if resp.GetCode() != envelopeCodeOK {
+		t.Fatalf("Stop after refusals must be a clean no-op, got code=%d message=%q", resp.GetCode(), resp.GetMessage())
 	}
 }
 
@@ -490,26 +517,30 @@ func TestServiceWireAllowedMethodsAndLifecycle(t *testing.T) {
 	mustHandshake(t, conn)
 
 	// Round 3: the policy fails closed on documents the strict parser cannot
-	// read, so an unparseable config is now a typed policy rejection on the
-	// wire instead of an in-band config error from the runtime parser.
-	status, data := wireCall(t, conn, 40, "CheckConfig", mustMarshal(t, &gen.LoadConfigReq{
+	// read, so an unparseable config is now a typed policy refusal on the
+	// wire (envelope code 3, ERR_CONFIG_POLICY in the message) instead of an
+	// in-band config error from the runtime parser.
+	resp := envCall(t, conn, 40, "CheckConfig", mustMarshal(t, &gen.LoadConfigReq{
 		CoreConfig: proto.String("{ definitely not json }"),
 	}))
-	if status != 1 || !strings.HasPrefix(string(data), errConfigPolicy) {
-		t.Fatalf("CheckConfig must fail closed with %s on an unparseable document, got status=%d data=%q", errConfigPolicy, status, string(data))
+	if resp.GetCode() != envelopeCodeInvalidRequest || !strings.HasPrefix(resp.GetMessage(), errConfigPolicy) {
+		t.Fatalf("CheckConfig must fail closed with %s, got code=%d message=%q", errConfigPolicy, resp.GetCode(), resp.GetMessage())
+	}
+	if len(resp.GetTypedPayload()) != 0 {
+		t.Fatalf("a refused request carries no payload, got %d bytes", len(resp.GetTypedPayload()))
 	}
 
 	// Strict JSON that passes the policy but fails runtime validation still
-	// reports INSIDE ErrorResp (status=0): the typed policy rejection is
-	// reserved for policy violations, not runtime schema errors.
-	status, data = wireCall(t, conn, 46, "CheckConfig", mustMarshal(t, &gen.LoadConfigReq{
+	// reports INSIDE ErrorResp (code=0, typed payload): the envelope refusal
+	// is reserved for refusals, not runtime schema errors.
+	resp = envCall(t, conn, 46, "CheckConfig", mustMarshal(t, &gen.LoadConfigReq{
 		CoreConfig: proto.String(`{"inbounds":[{"type":"no-such-inbound-type"}],"outbounds":[]}`),
 	}))
-	if status != 0 {
-		t.Fatalf("CheckConfig must stay reachable over the service wire path, got status=%d data=%q", status, string(data))
+	if resp.GetCode() != envelopeCodeOK {
+		t.Fatalf("CheckConfig must stay reachable over the service wire path, got code=%d message=%q", resp.GetCode(), resp.GetMessage())
 	}
 	checkResp := &gen.ErrorResp{}
-	if err := proto.Unmarshal(data, checkResp); err != nil {
+	if err := proto.Unmarshal(resp.GetTypedPayload(), checkResp); err != nil {
 		t.Fatal(err)
 	}
 	if checkResp.GetError() == "" {
@@ -517,41 +548,41 @@ func TestServiceWireAllowedMethodsAndLifecycle(t *testing.T) {
 	}
 
 	cfg := `{"log":{"level":"warn"},"inbounds":[],"outbounds":[]}`
-	status, data = wireCall(t, conn, 41, "Start", mustMarshal(t, &gen.LoadConfigReq{CoreConfig: proto.String(cfg)}))
-	if status != 0 {
-		t.Fatalf("safe Start must be accepted, got status=%d data=%q", status, string(data))
+	resp = envCall(t, conn, 41, "Start", mustMarshal(t, &gen.LoadConfigReq{CoreConfig: proto.String(cfg)}))
+	if resp.GetCode() != envelopeCodeOK {
+		t.Fatalf("safe Start must be accepted, got code=%d message=%q", resp.GetCode(), resp.GetMessage())
 	}
 	startResp := &gen.ErrorResp{}
-	if err := proto.Unmarshal(data, startResp); err != nil {
+	if err := proto.Unmarshal(resp.GetTypedPayload(), startResp); err != nil {
 		t.Fatal(err)
 	}
 	if startResp.GetError() != "" {
 		t.Fatalf("safe Start failed: %s", startResp.GetError())
 	}
 
-	status, data = wireCall(t, conn, 42, "Health", nil)
-	if status != 0 {
-		t.Fatalf("Health while running failed: status=%d", status)
+	resp = envCall(t, conn, 42, "Health", nil)
+	if resp.GetCode() != envelopeCodeOK {
+		t.Fatalf("Health while running failed: code=%d", resp.GetCode())
 	}
 	health := &gen.HealthResp{}
-	if err := proto.Unmarshal(data, health); err != nil {
+	if err := proto.Unmarshal(resp.GetTypedPayload(), health); err != nil {
 		t.Fatal(err)
 	}
 	if !health.GetRuntimeRunning() {
 		t.Fatal("Health must report the running runtime")
 	}
 
-	for i := uint32(43); i <= 44; i++ {
-		status, data = wireCall(t, conn, i, "Stop", mustMarshal(t, &gen.EmptyReq{}))
-		if status != 0 {
-			t.Fatalf("Stop #%d failed: status=%d data=%q", i-42, status, string(data))
+	for i := uint64(43); i <= 44; i++ {
+		resp = envCall(t, conn, i, "Stop", mustMarshal(t, &gen.EmptyReq{}))
+		if resp.GetCode() != envelopeCodeOK {
+			t.Fatalf("Stop #%d failed: code=%d message=%q", i-42, resp.GetCode(), resp.GetMessage())
 		}
 	}
-	status, data = wireCall(t, conn, 45, "Health", nil)
-	if status != 0 {
-		t.Fatalf("Health after stop failed: status=%d", status)
+	resp = envCall(t, conn, 45, "Health", nil)
+	if resp.GetCode() != envelopeCodeOK {
+		t.Fatalf("Health after stop failed: code=%d", resp.GetCode())
 	}
-	if err := proto.Unmarshal(data, health); err != nil {
+	if err := proto.Unmarshal(resp.GetTypedPayload(), health); err != nil {
 		t.Fatal(err)
 	}
 	if health.GetRuntimeRunning() {
@@ -569,13 +600,14 @@ func TestServiceWireOmittedFieldsAreNormalized(t *testing.T) {
 	mustHandshake(t, conn)
 
 	// CheckConfig with no fields at all: upstream reports config errors
-	// INSIDE ErrorResp (status=0); the contract here is "clean error, no panic".
-	status, data := wireCall(t, conn, 50, "CheckConfig", nil)
-	if status != 0 {
-		t.Fatalf("CheckConfig with an empty request must answer with a response, got status=%d data=%q", status, string(data))
+	// INSIDE ErrorResp (code=0, typed payload); the contract here is "clean
+	// error, no panic".
+	resp := envCall(t, conn, 50, "CheckConfig", nil)
+	if resp.GetCode() != envelopeCodeOK {
+		t.Fatalf("CheckConfig with an empty request must answer with a response, got code=%d message=%q", resp.GetCode(), resp.GetMessage())
 	}
 	checkResp := &gen.ErrorResp{}
-	if err := proto.Unmarshal(data, checkResp); err != nil {
+	if err := proto.Unmarshal(resp.GetTypedPayload(), checkResp); err != nil {
 		t.Fatal(err)
 	}
 	if checkResp.GetError() == "" || strings.Contains(checkResp.GetError(), "core panic") {
@@ -583,12 +615,12 @@ func TestServiceWireOmittedFieldsAreNormalized(t *testing.T) {
 	}
 
 	// Start with no fields at all: same response contract, no runtime left.
-	status, data = wireCall(t, conn, 51, "Start", nil)
-	if status != 0 {
-		t.Fatalf("Start with an empty request must answer with a response, got status=%d data=%q", status, string(data))
+	resp = envCall(t, conn, 51, "Start", nil)
+	if resp.GetCode() != envelopeCodeOK {
+		t.Fatalf("Start with an empty request must answer with a response, got code=%d message=%q", resp.GetCode(), resp.GetMessage())
 	}
 	startEmpty := &gen.ErrorResp{}
-	if err := proto.Unmarshal(data, startEmpty); err != nil {
+	if err := proto.Unmarshal(resp.GetTypedPayload(), startEmpty); err != nil {
 		t.Fatal(err)
 	}
 	if startEmpty.GetError() == "" || strings.Contains(startEmpty.GetError(), "core panic") {
@@ -599,41 +631,73 @@ func TestServiceWireOmittedFieldsAreNormalized(t *testing.T) {
 	}
 
 	// need_xray without xray_config is a typed invalid request, not a panic.
-	status, data = wireCall(t, conn, 52, "Start", mustMarshal(t, &gen.LoadConfigReq{
+	resp = envCall(t, conn, 52, "Start", mustMarshal(t, &gen.LoadConfigReq{
 		NeedXray:   proto.Bool(true),
 		CoreConfig: proto.String(`{"inbounds":[],"outbounds":[]}`),
 	}))
-	if status != 1 || !strings.HasPrefix(string(data), errInvalidRequest) {
-		t.Fatalf("want %s for need_xray without xray_config, got status=%d data=%q", errInvalidRequest, status, string(data))
+	if resp.GetCode() != envelopeCodeInvalidRequest || !strings.HasPrefix(resp.GetMessage(), errInvalidRequest) {
+		t.Fatalf("want %s for need_xray without xray_config, got code=%d message=%q", errInvalidRequest, resp.GetCode(), resp.GetMessage())
 	}
 
 	// Still serving after all of the above.
-	status, _ = wireCall(t, conn, 53, "Health", nil)
-	if status != 0 {
-		t.Fatalf("Health after normalization cases must succeed, got status=%d", status)
+	resp = envCall(t, conn, 53, "Health", nil)
+	if resp.GetCode() != envelopeCodeOK {
+		t.Fatalf("Health after normalization cases must succeed, got code=%d", resp.GetCode())
 	}
 }
 
 // The legacy GUI-child table must be untouched: it still carries the
-// privileged utility RPC, while the service allowlist exposes exactly the
-// five permitted methods and nothing else.
-func TestServiceAllowlistVsLegacyTable(t *testing.T) {
+// privileged utility RPC, while the service registry (the single PC-110
+// operation table) exposes exactly the five permitted operations — and binds
+// CheckConfig/Start to the Service* handlers that enforce the config policy,
+// never to the raw legacy ones.
+func TestServiceRegistryVsLegacyTable(t *testing.T) {
 	for _, method := range []string{"SetSystemDNS", "InstallDashboard", "Start", "Stop", "CheckConfig"} {
 		if handlers[method] == nil {
 			t.Fatalf("legacy handlers map lost %q — the GUI-child path must stay unchanged", method)
 		}
 	}
-	want := map[string]bool{"Hello": true, "Health": true, "CheckConfig": true, "Start": true, "Stop": true}
-	if len(serviceMethodAllowlist) != len(want) {
-		t.Fatalf("service allowlist size = %d, want %d", len(serviceMethodAllowlist), len(want))
+	want := []string{"Hello", "Health", "CheckConfig", "Start", "Stop"}
+	if len(serviceOperations) != len(want) {
+		t.Fatalf("service registry size = %d, want %d", len(serviceOperations), len(want))
 	}
-	for method := range serviceMethodAllowlist {
-		if !want[method] {
-			t.Fatalf("unexpected method %q in the service allowlist", method)
+	for _, op := range want {
+		if _, ok := serviceOperations[op]; !ok {
+			t.Fatalf("service registry lost %q", op)
 		}
 	}
-	if _, err := dispatchService("SetSystemDNS", nil); err == nil || !strings.HasPrefix(err.Error(), errMethodNotAllowed) {
-		t.Fatalf("dispatchService must reject SetSystemDNS, got %v", err)
+	if _, ok := serviceOperations["SetSystemDNS"]; ok {
+		t.Fatal("the service registry must not carry privileged legacy RPC")
+	}
+
+	// The registry binds the SERVICE handlers: a hostile config through the
+	// registry's CheckConfig hits the config policy (ERR_CONFIG_POLICY),
+	// while the legacy dispatch table's CheckConfig has no policy and accepts
+	// the very same document (log.output is a legitimate sing-box field; the
+	// GUI-child contract never had a policy). Two tables, two behaviors — the
+	// service wire path only ever consults the registry.
+	hostile := &gen.LoadConfigReq{CoreConfig: proto.String(`{"log":{"output":"C:\\evil.log"}}`)}
+	payload := mustMarshal(t, hostile)
+	_, registryErr := serviceOperations["CheckConfig"].call(context.Background(), func() proto.Message {
+		msg, err := serviceOperations["CheckConfig"].decode(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return msg
+	}())
+	if registryErr == nil || !strings.HasPrefix(registryErr.Error(), errConfigPolicy) {
+		t.Fatalf("registry CheckConfig must enforce the config policy, got %v", registryErr)
+	}
+	legacyData, legacyErr := dispatch("CheckConfig", payload)
+	if legacyErr != nil {
+		t.Fatalf("legacy CheckConfig dispatch: %v", legacyErr)
+	}
+	legacyResp := &gen.ErrorResp{}
+	if err := proto.Unmarshal(legacyData, legacyResp); err != nil {
+		t.Fatal(err)
+	}
+	if legacyResp.GetError() != "" {
+		t.Fatalf("legacy CheckConfig must stay policy-free (GUI-child contract) and accept the same document, got %q", legacyResp.GetError())
 	}
 }
 
