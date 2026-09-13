@@ -392,3 +392,42 @@ added the parser-semantics suite (7 tests). Everything re-verified at
   and the formal limits/bounded concurrency.
 - If upstream refactors main.go's RunCore, the small mode-dispatch hunk may
   conflict — kept to ~13 lines for exactly that reason.
+
+## VM evidence run (2026-09-13) — the VM-only items are executed
+
+Disposable VirtualBox 7.2.16 VM `PC100-Evidence` (Windows 11 Pro 25H2 26200, EFI+TPM,
+2nd NIC as expendable test adapter; host: Windows 11 Home, non-elevated agent shell,
+no host mutations — all sc.exe/netsh/registry work inside the VM). Evidence target:
+HEAD `bfd79c58` + the uncommitted PC-110 remediation tree (fingerprint in the package
+manifest). Package: `D:\GLM_project\vm-evidence\evidence-package\` (raw logs + summary).
+
+- **SCM lifecycle**: `sc create ProxyCoreService binPath="C:\spike\ThroneCore.exe service"`
+  → Running as LocalSystem (PID observed, pipe `\\.\pipe\ProxyCoreService` present) →
+  `sc stop` → STOPPED (process exit) → `sc start` again → duplicate stop rc 1062 →
+  `sc delete` (query 1060). Done twice with two builds of the same tree.
+- **Non-SCM direct run**: `ThroneCore.exe service` outside SCM fails closed
+  ("service mode requested outside the Windows SCM"), nonzero exit.
+- **Non-elevated client refusal**: local non-admin user `limited` (own SID, batch-logon
+  granted) dials the pipe under default SDDL `D:P(A;;GA;;;SY)(A;;GA;;;BA)` → refused
+  (`UnauthorizedAccessException: Access is denied`, 593 ms).
+- **SDDL refusal**: same run as above — the refusal is the SDDL denial, not a service fault
+  (admin dial CONNECTED as positive control before and after).
+- **SDDL grant direction**: `THRONE_SERVICE_SDDL=D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;<limited-SID>)`
+  via SCM Environment → limited dial CONNECTED (390 ms), admin dial still CONNECTED.
+- **Full suite baseline in the clean VM**: `go test -count=1` ThroneCore + internal/xray +
+  internal/xraydns with exact CI tags → ok/ok/ok (9.8s/3.5s/4.1s).
+- **winipcfg suite**: 30/30 PASS on `winipcfg_test0` (elevated; adapter: static IPv4,
+  DNS none on both families, IPv6 bound, RouterDiscovery=disabled to suppress VBox-NAT
+  RDNSS — probe showed `fd17:625c:f037:3::3` from RA merging into `LUID.DNS()` AF_UNSPEC
+  read-back and tripping TestSetDNS's count; environment artifact, not code).
+- **Clean build in VM**: exact CI tags, CGO_ENABLED=0, Go 1.27.0 → exit 0,
+  ThroneCore.exe sha256 `81D1A4D982323220D81B4F88819AFE2121599FC8E37AE0718816D6F272F4AB47`.
+
+Caveats recorded honestly: one transient `sc stop` >60 s in round 2 (stops ~0 s in rounds
+1/3; consistent with the earlier one-time winio ListenPipe flake); round-1 lifecycle ran on
+the host-built fallback exe (same tree) after a launcher-script bug (missing `-ldflags`)
+broke the first in-VM build; fixed and re-run — in-VM build PASS captured separately.
+
+Status: the PC-100 "BLOCKED (VM evidence)" items are executed and archived. Gate 0/1 are
+NOT declared closed by this note — formal closure stays the owner's call (C++ leg of Gate 0
+remains compile-blind on this machine; PC-110 remediation tree is still uncommitted).

@@ -294,3 +294,28 @@ HealthResp, before LoadConfigReq).
   start/stop, non-elevated refusal, SDDL refusal under a normal user); PC-110
   inherits every VM-bound item. Gate 0/1 remain open. No push, no service
   installed, no network mutations.
+## 2026-09-13 (продолжение) — VM-evidence прогон выполнен
+
+- [PC-100 VM] Владелец выбрал одноразовую VM и включил SVM в BIOS. Прогон сделан в
+  VirtualBox 7.2.16 (Win11 Pro 25H2 26200, VM `PC100-Evidence` на D:\GLM_project\vm-evidence).
+  Хост не мутировался: оболочка агента не-elevated, sc.exe/netsh/реестр — только внутри VM;
+  elevation в госте — password-logon задачи Task Scheduler (полный токен, без UAC-фильтра).
+- [PC-100 VM] Результаты (сырые логи + сводка: `D:\GLM_project\vm-evidence\evidence-package\`):
+  чистая сборка в VM PASS (ThroneCore.exe sha256 `81D1A4D9…`); реальный SCM-цикл
+  create→Running(LocalSystem, PID)→stop→start→duplicate-stop(1062)→delete(1060) PASS;
+  прямой запуск `service` вне SCM — fail-closed отказ; dial локальным не-админом `limited`
+  при SDDL по умолчанию — ОТКАЗ (Access is denied, 593 мс) при CONNECTED positive-control
+  от админа; SDDL-grant через SCM Environment (per-user SID) — CONNECTED (390 мс);
+  полный набор ok/ok/ok; winipcfg 30/30 PASS на `winipcfg_test0`.
+- [PC-100 VM] Разбор winipcfg: тестовый адаптер NAT выдавал RDNSS `fd17:625c:f037:3::3`,
+  который `LUID.DNS()` (AF_UNSPEC) мерджил в read-back и ломал счётчик TestSetDNS;
+  `RouterDiscovery=disabled` на адаптере устраняет источник (IPv6-row сохранён для
+  TestIPInterface). Средовой артефакт, не код.
+- [PC-100 VM] Честные оговорки: один транзиент `sc stop` >60 с (раунды 1/3 — ~0 с; похоже
+  на ранее записанный разовый winio-флейк); раунд-1 жизненный цикл шёл на host-fallback exe
+  того же дерева из-за бага гостевого лаунчера (потерян `-ldflags`), исправлено и пересобрано
+  в VM отдельно.
+- [PC-100/PC-110] Статус: VM-evidence выполнен и заархивирован (секция «VM evidence run
+  (2026-09-13)» в pc-100-report.md). Gate 0/1 НЕ объявляются закрытыми (C++-нога Gate 0
+  compile-blind, формальное закрытие — решение владельца). Дерево PC-110-ремедиации
+  по-прежнему uncommitted поверх `bfd79c58` — данный коммит только документация.
