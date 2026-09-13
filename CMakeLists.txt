@@ -569,6 +569,15 @@ qt_add_executable(Throne
         ${PROJECT_SOURCES}
 )
 
+# PC-010: src/proxycore/storage/ThroneMigration.cpp includes
+# <SQLiteCpp/SQLiteCpp.h>; the bundled sources are compiled into this
+# target (see PROJECT_SOURCES above) but nothing put their headers on its
+# include path, so clean-checkout builds failed with C1083. PRIVATE: an
+# executable has no consumers.
+target_include_directories(Throne PRIVATE
+        ${CMAKE_SOURCE_DIR}/3rdparty/SQLiteCpp/include
+)
+
 # Target
 
 set_property(TARGET Throne PROPERTY AUTOUIC ON)
