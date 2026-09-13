@@ -420,3 +420,4 @@ jobs:
         if: github.event.inputs.publish == 'r'
         run: |
           ./ghr -delete -c ${{ github.sha }} -t "${{ github.token }}" -n "${{ github.event.inputs.tag }}" "${{ github.event.inputs.tag }}" deployment
+
