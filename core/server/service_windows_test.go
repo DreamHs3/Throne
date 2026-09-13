@@ -259,7 +259,7 @@ func serveOverPipe(t *testing.T) (client net.Conn, done <-chan struct{}) {
 	serverConn, clientConn := net.Pipe()
 	finished := make(chan struct{})
 	go func() {
-		serveServiceConn(serverConn)
+		serveServiceConnContext(context.Background(), serverConn, newServiceHandlerGate())
 		close(finished)
 	}()
 	t.Cleanup(func() {
@@ -756,6 +756,7 @@ func TestServiceHandlerExecuteLifecycleWithoutSCM(t *testing.T) {
 	// Keep the Execute test off the production pipe name.
 	t.Setenv("THRONE_SERVICE_PIPE", `\\.\pipe\ProxyCoreServiceTest-Execute`)
 	t.Setenv("THRONE_SERVICE_SDDL", "D:P(A;;GA;;;SY)(A;;GA;;;BA)")
+	resetServiceRuntimeStoppingForTest(t)
 
 	requests := make(chan svc.ChangeRequest)
 	statuses := make(chan svc.Status, 16)

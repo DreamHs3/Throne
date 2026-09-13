@@ -23,13 +23,14 @@ import (
 )
 
 // serveEnvelopeContextOverPipe drives serveServiceConnContext with the given
-// context (the shutdown tests need to cancel it).
+// context (the shutdown tests need to cancel it) and this connection's own
+// admission gate.
 func serveEnvelopeContextOverPipe(t *testing.T, ctx context.Context) (client net.Conn, finished <-chan struct{}) {
 	t.Helper()
 	serverConn, clientConn := net.Pipe()
 	done := make(chan struct{})
 	go func() {
-		serveServiceConnContext(ctx, serverConn)
+		serveServiceConnContext(ctx, serverConn, newServiceHandlerGate())
 		close(done)
 	}()
 	t.Cleanup(func() {

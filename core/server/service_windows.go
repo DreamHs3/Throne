@@ -18,7 +18,6 @@ import (
 	"log"
 	"net"
 	"os"
-	runtimeDebug "runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -262,48 +261,179 @@ func (cs *connSet) closeAll() {
 	cs.mu.Unlock()
 }
 
-// serviceHandlersWG tracks in-flight handler goroutines across all
-// connections so shutdown can wait for them in a bounded way.
-var serviceHandlersWG sync.WaitGroup
 var serviceHandlerSlots = make(chan struct{}, serviceHandlerConcurrencyGlobal)
 var servicePayloadSlots = semaphore.NewWeighted(servicePayloadBudget)
 
-// waitServiceHandlers waits up to d for in-flight handlers to finish.
-func waitServiceHandlers(d time.Duration) {
+// errServiceStopping is the typed refusal of work that arrived after the
+// service began stopping; the envelope classifier maps it to
+// envelopeCodeServiceUnavailable.
+var errServiceStopping = errors.New("service is shutting down")
+
+// serviceRuntimeMu guards the service path's runtime-creation barrier state:
+// serviceRuntimeStopping (the shutdown mark, set once per run) and
+// serviceRuntimeStarting (ServiceStart executions that passed the pre-check
+// and have not finished their post-check yet). Every critical section under
+// this lock is O(1) flag/counter work — the lock is NEVER held across the
+// legacy Start, so the stop path cannot be stalled by a slow or hanging
+// runtime creation (F7: the previous design held this lock across
+// globalServer.Start while the stop path blocked on it with no timeout,
+// which contradicted the documented bounded shutdown).
+var serviceRuntimeMu sync.Mutex
+var serviceRuntimeStopping bool
+var serviceRuntimeStarting int
+
+// beginServiceRuntimeShutdown raises the shutdown mark. It is O(1): only flag
+// work happens under the lock, so it cannot block on an in-flight runtime
+// creation. A Start that finishes past the mark tears its own runtime down in
+// its post-check (see ServiceStart) instead of the stop path waiting for it.
+func beginServiceRuntimeShutdown() {
+	serviceRuntimeMu.Lock()
+	serviceRuntimeStopping = true
+	serviceRuntimeMu.Unlock()
+}
+
+// resetServiceRuntimeBarrier clears the barrier state for a fresh service
+// run. Production exits after Stopped so this is belt-and-braces (and it lets
+// tests drive Execute repeatedly in one process without cross-run pollution).
+func resetServiceRuntimeBarrier() {
+	serviceRuntimeMu.Lock()
+	serviceRuntimeStopping = false
+	serviceRuntimeStarting = 0
+	serviceRuntimeMu.Unlock()
+}
+
+// serviceRuntimeInflight reports the number of ServiceStart executions
+// between their pre-check and post-check (tests and diagnostics).
+func serviceRuntimeInflight() int {
+	serviceRuntimeMu.Lock()
+	defer serviceRuntimeMu.Unlock()
+	return serviceRuntimeStarting
+}
+
+// serviceStartPause is a test seam (production leaves it nil): called inside
+// ServiceStart after every validation and immediately before the
+// runtime-creation barrier pre-check, so a test can suspend a Start that has
+// already passed handler admission, both slot waits and the request-context
+// re-check — the exact suspension point of the Start-vs-shutdown race.
+var serviceStartPause func()
+
+// serviceStartDelegate performs the runtime-creating phase of ServiceStart.
+// Production delegates to the legacy Start; tests stub it to stage the
+// Start-vs-shutdown race deterministically from INSIDE the creation phase
+// (past the pre-check) — a point no config-driven pause can reach, and the
+// exact window the shutdown mark must cover without stalling the stop path.
+var serviceStartDelegate = func(ctx context.Context, in *gen.LoadConfigReq) (*gen.ErrorResp, error) {
+	return globalServer.Start(ctx, in)
+}
+
+// serviceHandlerGate is the shutdown/admission barrier for one service run.
+// It closes handler admission synchronously at shutdown and makes a
+// WaitGroup.Add after the shutdown Wait has become possible impossible:
+//
+//	admit() and beginShutdown() share one mutex, so the two operations are
+//	totally ordered. If admit() wins the critical section, its wg.Add(1) is
+//	already counted before beginShutdown runs, and the Wait that may only be
+//	started after beginShutdown returns observes it. If beginShutdown wins,
+//	closing is set before any subsequent admit() runs (same mutex), so those
+//	admits fail WITHOUT an Add. There is no third ordering. Hence: after
+//	beginShutdown returns, no Add can happen, and the Wait observes exactly
+//	the handlers admitted before shutdown.
+//
+// One gate per service run (created in Execute): the WaitGroup it owns dies
+// with the run, so neither runs nor tests can pollute each other's counts.
+type serviceHandlerGate struct {
+	mu      sync.Mutex
+	closing bool
+	pending int // admitted handlers not yet finished (mirror of the wg count)
+	wg      sync.WaitGroup
+}
+
+func newServiceHandlerGate() *serviceHandlerGate { return &serviceHandlerGate{} }
+
+// admit admits one handler for execution: the caller may spawn a handler
+// goroutine, which must eventually call release exactly once. After
+// beginShutdown it always returns false and never touches the WaitGroup.
+func (g *serviceHandlerGate) admit() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closing {
+		return false
+	}
+	g.pending++
+	g.wg.Add(1)
+	return true
+}
+
+// release pairs a successful admit.
+func (g *serviceHandlerGate) release() {
+	g.mu.Lock()
+	g.pending--
+	g.mu.Unlock()
+	g.wg.Done()
+}
+
+// admitConn reports whether a newly accepted connection may start serving.
+// It shares the gate's mutex, so once beginShutdown has run it is refused
+// synchronously: a connection accepted in the Accept/shutdown race is closed
+// here and never reaches a handshake. Unlike handlers, connections
+// contribute no WaitGroup count — established connections are dropped by
+// conns.closeAll (their serve loops exit on the next read), so they cannot
+// stall the bounded shutdown, and idle connections keep their established
+// semantics until shutdown closes them.
+func (g *serviceHandlerGate) admitConn() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return !g.closing
+}
+
+// beginShutdown closes admission synchronously and returns a channel that
+// closes when every handler admitted before shutdown has finished. The wait
+// must only be started on (or after) this call — that is what makes the
+// Add-vs-Wait race impossible.
+func (g *serviceHandlerGate) beginShutdown() <-chan struct{} {
+	g.mu.Lock()
+	g.closing = true
+	g.mu.Unlock()
 	done := make(chan struct{})
 	go func() {
-		serviceHandlersWG.Wait()
+		g.wg.Wait()
 		close(done)
 	}()
-	select {
-	case <-done:
-	case <-time.After(d):
-	}
+	return done
+}
+
+// inflight reports the number of admitted handlers not yet finished (tests
+// and diagnostics).
+func (g *serviceHandlerGate) inflight() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.pending
 }
 
 // serveServiceListener is the accept loop. Every client is authorized by
 // token identity before it can reach the handshake, let alone a method.
-func serveServiceListener(listener net.Listener, conns *connSet, stopCh <-chan struct{}) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() {
-		select {
-		case <-stopCh:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
+//
+// ctx is the service run's serve context; the SCM stop path cancels it
+// synchronously AFTER closing admission, so the two shutdown signals the
+// loop acts on (ctx cancel, stopCh, listener close) are ordered behind the
+// admission barrier. A connection whose Accept succeeds in the Accept/close
+// race is either admitted here before shutdown began (then its per-request
+// gates and its serve context refuse every operation) or closed below —
+// a connection never starts serving after admission has closed.
+func serveServiceListener(ctx context.Context, listener net.Listener, conns *connSet, stopCh <-chan struct{}, admission *serviceHandlerGate) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			select {
 			case <-stopCh:
 				return
+			case <-ctx.Done():
+				return
 			default:
-				log.Printf("service pipe accept error: %v", err)
-				time.Sleep(500 * time.Millisecond)
-				continue
 			}
+			log.Printf("service pipe accept error: %v", err)
+			time.Sleep(500 * time.Millisecond)
+			continue
 		}
 		if !authorizeServiceClient(conn) {
 			_ = conn.Close()
@@ -313,9 +443,17 @@ func serveServiceListener(listener net.Listener, conns *connSet, stopCh <-chan s
 			_ = conn.Close()
 			continue
 		}
+		// Connection admission shares the lifecycle gate with handler
+		// admission: once shutdown has begun, the connection is closed
+		// here — before any handshake can start.
+		if !admission.admitConn() {
+			conns.remove(conn)
+			_ = conn.Close()
+			return
+		}
 		go func() {
 			defer conns.remove(conn)
-			serveServiceConnContext(ctx, conn)
+			serveServiceConnContext(ctx, conn, admission)
 		}()
 	}
 }
@@ -449,7 +587,13 @@ func tokenInformation(token windows.Token, class uint32) ([]byte, error) {
 	return buf, nil
 }
 
-type proxyCoreServiceHandler struct{}
+type proxyCoreServiceHandler struct {
+	// admission is this run's lifecycle gate, created in Execute and handed
+	// to the accept loop; the stop path closes it. A field (not a package
+	// variable) so each service run — and each test driving one — owns its
+	// own barrier and no run can pollute another's WaitGroup.
+	admission *serviceHandlerGate
+}
 
 // Execute implements svc.Handler. Testable without SCM: feed ChangeRequests
 // and collect Status values directly.
@@ -470,7 +614,15 @@ func (h *proxyCoreServiceHandler) Execute(args []string, r <-chan svc.ChangeRequ
 	var stopOnce sync.Once
 	conns := newConnSet()
 
-	go serveServiceListener(listener, conns, stopCh)
+	// The run's serve context: canceled synchronously by the stop path below
+	// (never via a watcher goroutine, whose delay would leave a window where
+	// serve loops still run after shutdown began).
+	serveCtx, serveCtxCancel := context.WithCancel(context.Background())
+	defer serveCtxCancel()
+	h.admission = newServiceHandlerGate()
+	resetServiceRuntimeBarrier()
+
+	go serveServiceListener(serveCtx, listener, conns, stopCh, h.admission)
 
 	status <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 
@@ -481,13 +633,40 @@ func (h *proxyCoreServiceHandler) Execute(args []string, r <-chan svc.ChangeRequ
 			status <- c.CurrentStatus
 		case svc.Stop, svc.Shutdown:
 			status <- svc.Status{State: svc.StopPending, WaitHint: 10000}
-			stopOnce.Do(func() { close(stopCh) })
-			_ = listener.Close()
-			conns.closeAll()
-			// Stop is idempotent by upstream contract (no instance → nil error).
-			_, _ = globalServer.Stop(context.Background(), &gen.EmptyReq{})
-			// Give in-flight handlers a bounded moment, then report stopped.
-			waitServiceHandlers(2 * time.Second)
+			// Coordinated shutdown sequence; Stopped is reported only after
+			// it completes, and every step is synchronous and bounded:
+			//  1. close admission — from here no handler can be admitted
+			//     (and no WaitGroup.Add can happen), and no newly accepted
+			//     connection starts serving;
+			//  2. interrupt every serve loop and the accept loop (context,
+			//     stop channel, listener);
+			//  3. drop established connections (their serve loops exit on
+			//     the next read — the client disconnect is a normal event);
+			//  4. raise the runtime shutdown mark — O(1) flag work under
+			//     serviceRuntimeMu, never across a runtime creation, so a
+			//     slow or hanging in-flight Start cannot stall it (F7);
+			//  5. stop the runtime (idempotent by upstream contract) —
+			//     ordered AFTER the mark; a Start that finishes past the
+			//     mark tears its own runtime down in its post-check and
+			//     refuses, so no runtime outlives Stopped except through
+			//     that bounded self-teardown;
+			//  6. wait, bounded, for the handlers admitted before shutdown —
+			//     a handler that will not finish in time cannot hold SCM
+			//     hostage (the process exits right after Stopped anyway).
+			stopOnce.Do(func() {
+				handlersDone := h.admission.beginShutdown()
+				serveCtxCancel()
+				close(stopCh)
+				_ = listener.Close()
+				conns.closeAll()
+				beginServiceRuntimeShutdown()
+				// Stop is idempotent by upstream contract (no instance → nil error).
+				_, _ = globalServer.Stop(context.Background(), &gen.EmptyReq{})
+				select {
+				case <-handlersDone:
+				case <-time.After(2 * time.Second):
+				}
+			})
 			status <- svc.Status{State: svc.Stopped}
 			return false, 0
 		default:
@@ -502,21 +681,36 @@ func (h *proxyCoreServiceHandler) Execute(args []string, r <-chan svc.ChangeRequ
 // legacy GUI-child frame layout stays in dispatch.go only — the two protocols
 // share no code, so neither can drift into the other.
 
-// serveServiceConn handles one client connection with the PC-110 envelope
-// protocol. A disconnect is a normal service-mode event: unlike runDispatch,
-// it never terminates the process.
+// serveServiceConnContext serves one client connection with the PC-110
+// envelope protocol. A disconnect is a normal service-mode event: unlike
+// runDispatch, it never terminates the process. admission is the service
+// run's lifecycle gate; the caller (the accept loop) has already admitted the
+// connection through it.
 //
-// Every request is validated as a whole before anything dispatches:
-// protocol version → shutdown gate → handshake state → request id → deadline
-// → expected config-policy revision → operation registry → typed payload.
+// EVERY frame — the mandatory Hello included — goes through the same
+// validation pipeline, in one place, with no diverging handshake branch:
+//
+//	protocol version → shutdown gate → handshake state → request_id →
+//	deadline → expected config-policy revision → operation registry →
+//	typed payload → request-id dedup → handler admission → deadline-aware
+//	slot waits → request-context re-check → dispatch
+//
+// The inline handshake skips only the admission/slot stages (it holds no
+// slots and contributes no WaitGroup count) and compensates with its own
+// reliable final gate: dispatchHandshake re-checks the serve context and the
+// request deadline immediately before op.call, so a Hello decoded after
+// shutdown began — or whose deadline expired since the serve loop's check —
+// never dispatches, and the handshake is never established after shutdown
+// began.
+//
 // Requests the serve loop itself refuses (unknown operation, wrong payload,
 // stale revision, expired deadline, duplicate id) never reach a handler and
 // never break the connection, so the client can correct and continue.
-func serveServiceConn(conn net.Conn) {
-	serveServiceConnContext(context.Background(), conn)
-}
-
-func serveServiceConnContext(ctx context.Context, conn net.Conn) {
+// Requests whose deadline expires while queued for a handler slot are
+// refused the same way (code 5), and the slot that freed up cannot
+// resurrect them: the request context is re-checked immediately before
+// op.call, in the handler goroutine itself.
+func serveServiceConnContext(ctx context.Context, conn net.Conn, admission *serviceHandlerGate) {
 	defer conn.Close()
 
 	var writeMu sync.Mutex
@@ -536,52 +730,75 @@ func serveServiceConnContext(ctx context.Context, conn net.Conn) {
 		return respond(reqID, code, msg, nil) == nil
 	}
 
-	ids := newServiceRequestIDs()
+	// dispatchHandshake runs the connection's first Hello — already validated
+	// by the pipeline — and answers the client. It is a separate function so
+	// it can OWN the frame: releaseServiceEnvelope runs exactly once on every
+	// path via defer, including the failed-answer path that previously
+	// returned without releasing and stranded the frame's weight in the
+	// aggregate payload budget (a leak a few connections could compound).
+	//
+	// The dispatch is guarded by a reliable final gate, run immediately
+	// before op.call — after every validation step, with nothing waited on in
+	// between (the inline handshake holds no slots, so the waits other
+	// requests do cannot defer the check): a Hello decoded after shutdown
+	// began, or whose deadline expired after the serve loop's deadline check,
+	// never reaches the registry entry — code 7 (shutdown disconnects, and no
+	// handshake is established after shutdown began), code 5 (late deadline;
+	// the connection stays usable for a corrected retry). The id stays
+	// consumed either way — the request was already accepted for execution,
+	// the same conservative rule as a request refused after admission.
+	// A shutdown that begins DURING the call still does not establish the
+	// handshake: handshakeDone is never set after shutdown began.
+	//
+	// keep=false tells the caller to stop serving the connection; done=true
+	// means the handshake was established.
+	dispatchHandshake := func(frame *serviceEnvelopeFrame, op serviceOperationDef, reqMsg proto.Message, reqID uint64) (keep, done bool) {
+		defer releaseServiceEnvelope(frame)
 
-	// Mandatory versioned handshake: the first envelope must be Hello and
-	// carry the protocol version the service speaks.
-	first, err := readServiceEnvelope(ctx, conn, false)
-	if err != nil {
-		var protoErr *envelopeProtocolError
-		if errors.As(err, &protoErr) {
-			_ = respond(0, protoErr.code, protoErr.msg, nil)
+		hctx, cancel := envelopeContext(ctx, frame.env)
+		defer cancel()
+
+		if ctx.Err() != nil {
+			_ = respond(reqID, envelopeCodeServiceUnavailable, "service is shutting down", nil)
+			return false, false
 		}
-		return
+		if hctx.Err() != nil {
+			_ = respond(reqID, envelopeCodeDeadlineExceeded,
+				fmt.Sprintf("%s: request %d deadline expired before dispatch", errDeadlineExceeded, reqID), nil)
+			return true, false
+		}
+		respMsg, callErr := callServiceOperation(op, hctx, reqMsg)
+		if callErr != nil {
+			_ = respond(reqID, envelopeCodeForHandlerError(callErr), callErr.Error(), nil)
+			return false, false
+		}
+		respBytes, marshalErr := proto.Marshal(respMsg)
+		if marshalErr != nil {
+			return false, false
+		}
+		if ctx.Err() != nil {
+			_ = respond(reqID, envelopeCodeServiceUnavailable, "service is shutting down", nil)
+			return false, false
+		}
+		if err := respond(reqID, envelopeCodeOK, "", respBytes); err != nil {
+			// The answer failed (client went away, write timeout): the defer
+			// above has already returned the frame's weight to the budget.
+			return false, false
+		}
+		return true, true
 	}
-	defer releaseServiceEnvelope(&first)
-	env := first.env
-	if env.GetProtocolVersion() != serviceProtocolVersion {
-		// An incompatible client is told why and disconnected.
-		_ = respond(env.GetRequestId(), envelopeCodeIncompatibleVersion,
-			fmt.Sprintf("%s: client %d, service %d", errProtocolVersion, env.GetProtocolVersion(), serviceProtocolVersion), nil)
-		return
-	}
-	if env.GetOperation() != "Hello" {
-		answer(&first, env.GetRequestId(), envelopeCodeInvalidRequest,
-			fmt.Sprintf("%s: first request must be the Hello operation", errNoHandshake))
-		return
-	}
-	opHello := serviceOperations["Hello"]
-	if _, decodeErr := opHello.decode(env.GetTypedPayload()); decodeErr != nil {
-		answer(&first, env.GetRequestId(), envelopeCodeInvalidRequest,
-			fmt.Sprintf("%s: Hello payload: %v", errInvalidRequest, decodeErr))
-		return
-	}
-	hsResp, err := proto.Marshal(&gen.HandshakeResp{
-		ProtocolVersion: To(int32(serviceProtocolVersion)),
-		ServiceVersion:  To(C.Version),
-	})
-	if err != nil {
-		return
-	}
-	if err := respond(env.GetRequestId(), envelopeCodeOK, "", hsResp); err != nil {
-		return
-	}
-	releaseServiceEnvelope(&first)
 
+	ids := newServiceRequestIDs()
+	// Per-connection handler concurrency: every spawned handler holds one
+	// token for its lifetime; the deadline-aware wait below parks requests
+	// beyond the bound without dispatching them.
 	handlerSem := make(chan struct{}, serviceHandlerConcurrencyPerConn)
+
+	handshakeDone := false
 	for {
-		frame, err := readServiceEnvelope(ctx, conn, true)
+		// The first frame is the handshake attempt: read with the handshake
+		// timeout, not the idle timeout.
+		frame, err := readServiceEnvelope(ctx, conn, handshakeDone)
 		if err != nil {
 			var protoErr *envelopeProtocolError
 			if errors.As(err, &protoErr) {
@@ -598,21 +815,29 @@ func serveServiceConnContext(ctx context.Context, conn net.Conn) {
 		reqID := env.GetRequestId()
 
 		if env.GetProtocolVersion() != serviceProtocolVersion {
-			// A client that suddenly speaks another version is incompatible;
-			// answer and disconnect.
+			// A client that speaks another version (from the first frame on)
+			// is incompatible; answer and disconnect.
 			answer(&frame, reqID, envelopeCodeIncompatibleVersion,
 				fmt.Sprintf("%s: client %d, service %d", errProtocolVersion, env.GetProtocolVersion(), serviceProtocolVersion))
 			return
 		}
 
-		// Shutdown refuses new work: nothing that arrives from here on
-		// reaches a handler.
+		// Shutdown refuses new work — a first Hello included: nothing that
+		// arrives from here on reaches a handler or establishes a session.
 		if ctx.Err() != nil {
 			answer(&frame, reqID, envelopeCodeServiceUnavailable, "service is shutting down")
 			return
 		}
 
-		if env.GetOperation() == "Hello" {
+		if !handshakeDone {
+			// The first frame must be the Hello operation; anything else
+			// means the client never speaks this protocol's handshake.
+			if env.GetOperation() != "Hello" {
+				answer(&frame, reqID, envelopeCodeInvalidRequest,
+					fmt.Sprintf("%s: first request must be the Hello operation", errNoHandshake))
+				return
+			}
+		} else if env.GetOperation() == "Hello" {
 			if !answer(&frame, reqID, envelopeCodeInvalidRequest,
 				fmt.Sprintf("%s: handshake already complete", errNoHandshake)) {
 				return
@@ -622,6 +847,7 @@ func serveServiceConnContext(ctx context.Context, conn net.Conn) {
 
 		if reqID == 0 {
 			// request_id is the dedup and correlation key; 0 is its absence.
+			// The handshake obeys the same rule as every other frame.
 			if !answer(&frame, 0, envelopeCodeInvalidRequest,
 				fmt.Sprintf("%s: request_id is required", errInvalidRequest)) {
 				return
@@ -630,6 +856,9 @@ func serveServiceConnContext(ctx context.Context, conn net.Conn) {
 		}
 
 		if ms := env.GetDeadlineUnixMs(); ms > 0 && !time.Now().Before(time.UnixMilli(ms)) {
+			// An expired deadline — on the handshake too — is refused before
+			// anything executes: no handshake is established, and the id is
+			// free for a corrected retry.
 			if !answer(&frame, reqID, envelopeCodeDeadlineExceeded,
 				fmt.Sprintf("%s: deadline %d already passed", errDeadlineExceeded, ms)) {
 				return
@@ -667,7 +896,9 @@ func serveServiceConnContext(ctx context.Context, conn net.Conn) {
 		}
 
 		// The id is recorded only when the request is accepted for execution,
-		// so a client can retry a refused request with the same id.
+		// so a client can retry a refused request with the same id. A request
+		// refused LATER (its deadline expired while queued) has already been
+		// accepted, so its id stays consumed and a retry needs a fresh id.
 		if !ids.tryAdd(reqID) {
 			if !answer(&frame, reqID, envelopeCodeDuplicateRequest,
 				fmt.Sprintf("%s: request id %d was already executed on this connection", errDuplicateRequest, reqID)) {
@@ -676,21 +907,62 @@ func serveServiceConnContext(ctx context.Context, conn net.Conn) {
 			continue
 		}
 
+		if !handshakeDone {
+			keep, done := dispatchHandshake(&frame, op, reqMsg, reqID)
+			if !keep {
+				return
+			}
+			handshakeDone = done
+			continue
+		}
+
+		// The request context is derived BEFORE the slot waits so the client
+		// deadline participates in them: a request whose deadline expires
+		// while queued never reaches a handler. Shutdown still aborts both
+		// waits (hctx is derived from the serve context).
+		hctx, cancel := envelopeContext(ctx, env)
+
+		// Handler admission under the lifecycle gate: once shutdown has
+		// begun this fails synchronously, so no WaitGroup.Add can happen
+		// after the shutdown Wait has become possible (serviceHandlerGate).
+		if !admission.admit() {
+			cancel()
+			answer(&frame, reqID, envelopeCodeServiceUnavailable, "service is shutting down")
+			return
+		}
+
 		// Handler concurrency is bounded both per connection and across the
-		// service; both waits abort on shutdown without spawning a handler.
-		serviceHandlersWG.Add(1)
+		// service. Each wait releases exactly what it acquired — nothing
+		// more, nothing less — and never spawns a handler after the request
+		// context died.
 		select {
 		case serviceHandlerSlots <- struct{}{}:
-		case <-ctx.Done():
-			serviceHandlersWG.Done()
+		case <-hctx.Done():
+			admission.release()
+			cancel()
+			if ctx.Err() == nil {
+				if !answer(&frame, reqID, envelopeCodeDeadlineExceeded,
+					fmt.Sprintf("%s: request %d deadline expired while waiting for a handler slot", errDeadlineExceeded, reqID)) {
+					return
+				}
+				continue
+			}
 			answer(&frame, reqID, envelopeCodeServiceUnavailable, "service is shutting down")
 			return
 		}
 		select {
 		case handlerSem <- struct{}{}:
-		case <-ctx.Done():
+		case <-hctx.Done():
 			<-serviceHandlerSlots
-			serviceHandlersWG.Done()
+			admission.release()
+			cancel()
+			if ctx.Err() == nil {
+				if !answer(&frame, reqID, envelopeCodeDeadlineExceeded,
+					fmt.Sprintf("%s: request %d deadline expired while waiting for a handler slot", errDeadlineExceeded, reqID)) {
+					return
+				}
+				continue
+			}
 			answer(&frame, reqID, envelopeCodeServiceUnavailable, "service is shutting down")
 			return
 		}
@@ -699,27 +971,28 @@ func serveServiceConnContext(ctx context.Context, conn net.Conn) {
 		// in-flight envelope memory stays bounded for the handler's lifetime.
 		weight := frame.weight
 		frame.weight = 0
-		hctx, cancel := envelopeContext(ctx, env)
 		go func(requestID uint64, op serviceOperationDef, msg proto.Message) {
-			defer serviceHandlersWG.Done()
+			// Ownership of admission, cancel and both slots transfers here:
+			// every path below releases each exactly once.
+			defer admission.release()
 			defer cancel()
 			defer func() { <-handlerSem }()
 			defer func() { <-serviceHandlerSlots }()
 			defer func() { servicePayloadSlots.Release(weight) }()
-			defer func() {
-				if r := recover(); r != nil {
-					// Same stack parity as runDispatch: a panic must be diagnosable.
-					log.Printf("panic in %s: %v\n%s", op.name, r, runtimeDebug.Stack())
-					_ = respond(requestID, envelopeCodeRuntimeFailure,
-						fmt.Sprintf("core panic in %s: %v", op.name, r), nil)
+			if hctx.Err() != nil {
+				// The request context died between admission and execution.
+				// This is the reliable check immediately before op.call: a
+				// request whose deadline expired in the queue — or during
+				// shutdown — runs nothing, no matter how the waits raced.
+				if ctx.Err() != nil {
+					_ = respond(requestID, envelopeCodeServiceUnavailable, "service is shutting down", nil)
+					return
 				}
-			}()
-			if ctx.Err() != nil {
-				// Shutdown won the race with the spawn; run nothing.
-				_ = respond(requestID, envelopeCodeServiceUnavailable, "service is shutting down", nil)
+				_ = respond(requestID, envelopeCodeDeadlineExceeded,
+					fmt.Sprintf("%s: request %d deadline expired before dispatch", errDeadlineExceeded, requestID), nil)
 				return
 			}
-			respMsg, callErr := op.call(hctx, msg)
+			respMsg, callErr := callServiceOperation(op, hctx, msg)
 			if callErr != nil {
 				_ = respond(requestID, envelopeCodeForHandlerError(callErr), callErr.Error(), nil)
 				return
@@ -735,15 +1008,23 @@ func serveServiceConnContext(ctx context.Context, conn net.Conn) {
 	}
 }
 
-// Hello and Health are the service-mode additive methods. They are NOT part
-// of the proto LibcoreService service block, so the generated server
-// interface (and the non-Windows builds) are unaffected; on Windows they are
-// registered into the existing handlers table below.
+// Hello and Health are the service-mode additive methods: NOT part of the
+// proto LibcoreService service block, so the generated server interface (and
+// the non-Windows builds) are unaffected; on Windows they are bound into the
+// serviceOperations registry (Hello and Health entries) and, for the legacy
+// GUI-child table compatibility, into handlers below.
 
+// Hello is the service-mode handshake operation — THE single Hello
+// semantics, bound into serviceOperations and dispatched there: the serve
+// loop's handshake phase calls this very registry entry after the envelope
+// pipeline has already gated the protocol version, so there is no second
+// HandshakeResp construction and no second version check. The envelope's
+// protocol_version is the single version authority (mismatch/absence → code 1
+// + disconnect, before any dispatch); HandshakeReq.protocol_version is not
+// consulted — it exists for wire compatibility with the PC-100 spike's
+// handshake and is documented as ignored. Hello carries no privileged
+// effect: it returns the service identity.
 func (s *server) Hello(ctx context.Context, in *gen.HandshakeReq) (*gen.HandshakeResp, error) {
-	if in.GetProtocolVersion() != serviceProtocolVersion {
-		return nil, fmt.Errorf("%s: client %d, service %d", errProtocolVersion, in.GetProtocolVersion(), serviceProtocolVersion)
-	}
 	return &gen.HandshakeResp{
 		ProtocolVersion: To(int32(serviceProtocolVersion)),
 		ServiceVersion:  To(C.Version),
@@ -823,7 +1104,50 @@ func (s *server) ServiceStart(ctx context.Context, in *gen.LoadConfigReq) (*gen.
 			return nil, err
 		}
 	}
-	return globalServer.Start(ctx, in)
+	// Runtime-creation barrier against the service shutdown (F7). The stop
+	// path raises the shutdown mark in O(1) and never waits for a creation;
+	// this side mirrors it in two O(1) steps around the delegation, which
+	// runs WITHOUT holding the barrier lock:
+	//   - pre-check: past the mark → refuse immediately (no boxmain.Create,
+	//     no Xray instance, no extra process);
+	//   - post-check: finished past the mark → tear down whatever the
+	//     delegation published (the stop path's final Stop may already have
+	//     run) and refuse with errServiceStopping (envelope code 7).
+	// Total order per Start: refused-before-creation, or created-then-torn-
+	// down. The teardown is idempotent (upstream Stop contract) and runs
+	// WITHOUT the barrier lock. No lock is ever held across another: the
+	// barrier lock is taken alone for flag/counter work, lifecycleMu alone
+	// inside the delegate/teardown — so no nesting, no deadlock. The legacy Start itself is untouched (protected file): the
+	// GUI-child path never sees the mark and behaves byte-identically; the
+	// mark, the checks and the teardown all live on the service path.
+	// Residual, documented: a creation that outlives the stop path's bounded
+	// handlers wait finishes its self-teardown after Stopped is published —
+	// transient by construction (the handler that performs it is already
+	// counted in the wait), never a persisting runtime.
+	if serviceStartPause != nil {
+		serviceStartPause()
+	}
+	serviceRuntimeMu.Lock()
+	if serviceRuntimeStopping {
+		serviceRuntimeMu.Unlock()
+		return nil, fmt.Errorf("%w: start refused", errServiceStopping)
+	}
+	serviceRuntimeStarting++
+	serviceRuntimeMu.Unlock()
+	defer func() {
+		serviceRuntimeMu.Lock()
+		serviceRuntimeStarting--
+		serviceRuntimeMu.Unlock()
+	}()
+	out, startErr := serviceStartDelegate(ctx, in)
+	serviceRuntimeMu.Lock()
+	stopping := serviceRuntimeStopping
+	serviceRuntimeMu.Unlock()
+	if stopping {
+		_, _ = globalServer.Stop(context.Background(), &gen.EmptyReq{})
+		return nil, fmt.Errorf("%w: start refused", errServiceStopping)
+	}
+	return out, startErr
 }
 
 // normalizeLoadConfigReq materializes absent proto2 optional pointers to

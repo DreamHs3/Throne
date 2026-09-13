@@ -20,7 +20,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
+	runtimeDebug "runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -223,10 +225,33 @@ var serviceOperations = map[string]serviceOperationDef{
 	"Stop":        typedServiceOperation("Stop", globalServer.Stop),
 }
 
+// callServiceOperation invokes a registry handler with the panic containment
+// the spawned handlers get: a panic becomes a typed runtime-failure error
+// instead of killing the serve goroutine (and with it the process). Both
+// dispatch sites — the inline handshake and the spawned handlers — go
+// through it, so there is exactly one panic policy.
+func callServiceOperation(op serviceOperationDef, ctx context.Context, msg proto.Message) (resp proto.Message, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// Same stack parity as runDispatch: a panic must be diagnosable.
+			log.Printf("panic in %s: %v\n%s", op.name, r, runtimeDebug.Stack())
+			err = fmt.Errorf("core panic in %s: %v", op.name, r)
+		}
+	}()
+	return op.call(ctx, msg)
+}
+
 // serviceRequestIDs remembers the request ids already executed on one
 // connection so a replayed id gets the typed duplicate error instead of a
 // second execution. Ids are recorded only when a request is accepted for
-// execution, so a client can retry a rejected request with the same id.
+// execution, so a client can retry a rejected request with the same id — the
+// mandatory Hello obeys the same rule: its id joins this connection's window
+// the moment the handshake is accepted, and a refused handshake (expired
+// deadline, stale revision, zero id) consumes nothing. Consequence, part of
+// the documented dedup contract: a later request must not reuse the
+// handshake's id (code 9), and a request refused after admission — its
+// deadline expired while queued — keeps its id consumed (a retry needs a
+// fresh id; the handler never ran, so this is conservative, never unsafe).
 // Memory is bounded: when the window is full, the oldest id is forgotten —
 // a replay older than the window is then the client's own contract violation.
 type serviceRequestIDs struct {
@@ -254,10 +279,13 @@ func (s *serviceRequestIDs) tryAdd(id uint64) bool {
 	return true
 }
 
-// envelopeContext derives the handler context: bound by the client deadline
+// envelopeContext derives the request context: bound by the client deadline
 // when one was sent, otherwise bounded only by the connection's lifetime
-// context (shutdown). Deadlines that have already passed are rejected by the
-// serve loop before dispatch, so this never sees an expired deadline.
+// context (shutdown). It is created BEFORE the handler-slot waits so the
+// deadline participates in them, and the handler goroutine re-checks it
+// immediately before op.call — a request whose deadline expired in the queue
+// never dispatches. Deadlines that have already passed are rejected by the
+// serve loop before this is called, so a fresh context is never expired.
 func envelopeContext(base context.Context, env *gen.RequestEnvelope) (context.Context, context.CancelFunc) {
 	if ms := env.GetDeadlineUnixMs(); ms > 0 {
 		return context.WithDeadline(base, time.UnixMilli(ms))
@@ -273,6 +301,12 @@ func envelopeContext(base context.Context, env *gen.RequestEnvelope) (context.Co
 // handler maps to "deadline exceeded". The specific typed prefix always
 // travels in the message.
 func envelopeCodeForHandlerError(err error) int32 {
+	if errors.Is(err, errServiceStopping) {
+		// Work refused because the service is stopping — a Start that took
+		// its runtime-creation lock after the shutdown mark — is
+		// service-unavailable, not a runtime failure.
+		return envelopeCodeServiceUnavailable
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return envelopeCodeDeadlineExceeded
 	}

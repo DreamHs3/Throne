@@ -294,6 +294,216 @@ HealthResp, before LoadConfigReq).
   start/stop, non-elevated refusal, SDDL refusal under a normal user); PC-110
   inherits every VM-bound item. Gate 0/1 remain open. No push, no service
   installed, no network mutations.
+
+## PC-110 remediation — 2026-09-13 (lifecycle barrier, deadline in waits, единый Hello)
+
+Branch: `agent/night-stage1-service-spike`, start HEAD `bfd79c58`
+(PC-110: versioned typed envelope contract for the service pipe), working
+tree clean. Основание: независимое ревью PC-110 подтвердило 2×P1 + 1×P2.
+Remediation baseline для сравнения регрессий: `2e1a6384`.
+
+- [PC-110] P1 deadline: request-контекст создаётся ДО ожидания
+  global/per-connection handler-слотов и участвует в обоих (`select` слот vs
+  `hctx.Done()`); горутина handler'а перепроверяет request-контекст
+  непосредственно перед `op.call`; просроченный в очереди запрос → `code=5`,
+  `ERR_DEADLINE_EXCEEDED`, исходный request_id, ничего не исполняется,
+  соединение живо; освобождение слотов/бюджета/WaitGroup/cancel — ровно один
+  раз на каждом пути; shutdown по-прежнему прерывает ожидания. Задокументировано:
+  отказ после admission сохраняет id занятым (retry с новым id).
+- [PC-110] P1 shutdown barrier: `serviceHandlerGate` — `admit()` и
+  `beginShutdown()` под одним мьютексом ⇒ тотальный порядок, `WaitGroup.Add`
+  после начала Wait невозможен по построению (не sleep'ами); `beginShutdown`
+  синхронно закрывает и приём соединений (`admitConn`); serve-контекст
+  отменяется синхронно из Stop-пути (watcher-горутина удалена); Stop Execute —
+  одна согласованная последовательность (admission → контекст/listener →
+  соединения → runtime → bounded wait 2 с → Stopped); gate — по экземпляру на
+  запуск службы (поле handler'а), без разделяемого глобального состояния.
+  Гонка successful Accept с закрытием: соединение после закрытия admission
+  закрывается до handshake (детерминированный тест).
+- [PC-110] P2 Hello: один validation pipeline для каждого кадра —
+  обязательный Hello проходит request_id/deadline/expected_policy_revision
+  (общий stale-гейт)/dedup/shutdown-гейты; handshake диспетчируется инлайн
+  через запись реестра `serviceOperations["Hello"]` (`callServiceOperation`),
+  ручная сборка HandshakeResp удалена — одна семантика Hello; envelope
+  `protocol_version` — единственный авторитет версии, поле в HandshakeReq
+  задокументировано как игнорируемое; отказанный Hello не потребляет id и не
+  рвёт соединение, завершённый handshake попадает в dedup-окно (повтор id →
+  `code=9`), второй Hello после handshake запрещён.
+- [PC-110] Security-границы перепроверены: wire-путь не вызывает `dispatch()`
+  и не читает legacy `handlers`; реестр — 5 операций, CheckConfig/Start
+  связаны с Service*; dispatch.go / server.go / service_config_policy.go
+  байт-в-байт неизменны (filesystem policy 2e1a6384 не тронута, обычные URL
+  paths разрешены).
+- [PC-110] Tests: +13 в новом `core/server/service_lifecycle_windows_test.go`
+  (gate-барьер; accept-гонка; полный Execute-shutdown с удержанным Start —
+  реальный proxyCoreServiceHandler.Execute, реальный winio pipe, Stopped без
+  runtime; deadline в global/per-connection ожидании; освобождение слота без
+  воскрешения; shutdown vs per-conn wait; Hello: id=0, expired, stale
+  revision, dedup id, payload-version ignored, shutdown-refusal). Suite:
+  `go test . -count=1` ok (65 тестов); `-count=20` ok (65×20); новые тесты
+  `-count=50` ok (13×50=650).
+- [PC-110] Checks: build exit 0; `go vet .` (tags) чист; `go vet ./...` —
+  только прежний baseline-finding internal/boxdns/dns_manager_windows.go:246;
+  gofmt -l изменённых файлов чист; `git diff --check` / `--cached --check`
+  чисты; `go test ./...` — базовые пакеты ok, winipcfg — те же 8 средовых
+  отказов (Element not found, без VM-адаптера) = baseline, не регрессия;
+  check_no_updater.sh — **BLOCKED как acceptance-evidence** (статический
+  grep по исходникам проходит с exit 0, но проверка, которая реально
+  подтверждает PC-020 — сборка/пакет GUI без updater'а — на этой машине
+  невозможна: нет C++-тулчейна; в результатах раунда не засчитывается);
+  `go test -race` — BLOCKED как и раньше (CGO_ENABLED=0, C-компилятора нет).
+  Уточнение объёма: «-count=50» и real-pipe тесты — IN-PROCESS: «SCM»-тесты
+  гоняют `Execute` напрямую с `svc.ChangeRequest`, без SCM — это контракт
+  обработчика, а не SCM-evidence; real non-elevated winio identity test
+  (`TestServiceClientIdentityRealPipe`) прошёл, но это НЕ SCM-тест.
+- [PC-110] Generated protobuf: `libcore.proto` не менялся; регенерация
+  protoc 31.1 byte-identical (libcore.pb.go
+  e0e15c6e…ee1ad1bd, libcore_grpc.pb.go 7cd45efa…aae93f); ignored-файлы в
+  commit не добавлялись.
+- [PC-100/PC-110] Статус не изменился: **BLOCKED** (VM evidence: SCM
+  start/stop, non-elevated refusal, SDDL refusal — только VM); Gate 0/1
+  открыты. Инцидент процесса: промежуточный `go fmt ./` переписал line
+  endings 8 файлов вне scope — содержимое не менялось (git diff пуст),
+  исходные байты восстановлены, итоговое дерево: 5 изменённых + 1 новый файл,
+  все в scope.
+
+## PC-110 remediation round 2 — 2026-09-13 (гонка runtime-vs-shutdown, барьер первого Hello, утечка бюджета)
+
+Branch: `agent/night-stage1-service-spike`, базис — uncommitted remediation
+поверх `bfd79c58`. Основание: повторное независимое ревью самой remediation
+подтвердило 2 новых дефекта (P1 + P2) и одну утечку (P2); до этого раунда
+вердикт — **REQUEST CHANGES**.
+
+- [PC-110] P1 runtime-vs-shutdown: `Execute` звал финальный
+  `globalServer.Stop` до завершения уже допущенных handler'ов —
+  приостановленный внутри `ServiceStart` Start мог создать runtime ПОСЛЕ
+  публикации `svc.Stopped` (Stop видел пустой runtime и был no-op).
+  Прежний тест держал Start на slot-wait, т.е. ДО `op.call` — окно внутри
+  работающего handler'а не было ни закрыто, ни протестировано. Фикс:
+  shutdown-марка под lifecycle-локом НА SERVICE-PATH — `serviceRuntimeMu`
+  сериализует единственную runtime-создающую фазу (делегирование
+  `ServiceStart` → legacy `Start`), марка `serviceRuntimeStopping`
+  поднимается стоп-путём `Execute` под тем же локом СТРОГО ДО финального
+  Stop; legacy `lifecycleMu` берётся строго ВНУТРИ этой критической секции
+  (внутри Start/Stop), обратный порядок невозможен — deadlock исключён.
+  Полный порядок: Start, взявший лок раньше, завершается — и Stop стоп-пути
+  (не может выполниться, пока лок занят) сносит его runtime до `Stopped`;
+  Start, взявший лок после марки, отказывает (`errServiceStopping` →
+  envelope code 7) — ни boxmain.Create, ни Xray, ни extra process; после
+  `Stopped` марка остаётся выставленной. Состояние живёт в service-файле,
+  НЕ в защищённом `server.go` (legacy GUI-child поведение байт-в-байт не
+  менялось); `serviceStartPause` — тестовый шов (в production nil) ровно в
+  точке приостановки.
+- [PC-110] P2 первый Hello: handshake диспетчился инлайн после ОДНОЙ
+  проверки `ctx.Err()` наверху пайплайна — отмена могла попасть между ней
+  и dispatch. Фикс: выделенная функция `dispatchHandshake` с надёжным
+  финальным гейтом непосредственно перед `op.call` (после всех валидаций,
+  без ожиданий между — inline handshake не держит слотов): Hello,
+  декодированный после начала shutdown — code 7 + disconnect, deadline,
+  истёкший после проверки serve-цикла — code 5 с живым соединением;
+  `handshakeDone` не выставляется после начала shutdown (и OK не
+  возвращается). Нюанс задокументирован: id остаётся занятым (запрос был
+  принят к исполнению) — повтор с тем же id даёт code 9, с новым —
+  завершает handshake.
+- [PC-110] P2 утечка бюджета: ветка неудачной записи ответа handshake
+  возвращалась без `releaseServiceEnvelope` — вес кадра навсегда застревал
+  в агрегатном бюджете 64 МиБ. Фикс: `dispatchHandshake` владеет кадром —
+  `defer releaseServiceEnvelope(frame)` сразу после успешного чтения,
+  возврат веса ровно один раз на каждом пути (успех, ошибка handler'а,
+  marshal, ошибка записи, отказ).
+- [PC-110] Tests: +4 в `service_lifecycle_windows_test.go` (теперь 17):
+  `TestServiceExecuteStoppedRefusesSuspendedStart` (реальный Execute +
+  реальный winio pipe: Start проходит admission/слоты/hctx-проверку и
+  приостановлен внутри `ServiceStart`; SCM-Stop завершается при
+  приостановленном Start — `Stopped` при живом handler'е; возобновлённый
+  Start отказывает — runtime sink не достигнут, после `Stopped` нет box/
+  Xray/extra process); `TestEnvelopeHelloShutdownAfterDecodeNoDispatch` и
+  `TestEnvelopeHelloDeadlineExpiredBeforeDispatch` (Hello прочитан,
+  валидирован, декодирован — парк в pass-through стабе реестра; затем
+  shutdown/истечение дедлайна; после снятия барьера реальный
+  `globalServer.Hello` НЕ вызывается, handshake не установлен, OK нет);
+  `TestEnvelopeHandshakeAnswerWriteFailureReleasesBudget` (валидный Hello,
+  клиент закрывается после length-заголовка ответа → отказ записи;
+  serve-цикл завершается, полный бюджет доступен снова; 8 повторов).
+  Мутационная верификация: каждый из трёх фиксов временно отключался —
+  соответствующий тест падал с ожидаемым сообщением; фиксы восстановлены.
+  Execute-тесты сбрасывают липкую марку через
+  `resetServiceRuntimeStoppingForTest` (production после `Stopped`
+  завершается; тестовый процесс — нет).
+- [PC-110] Checks: build exit 0; `go vet -a ./...` — только прежний
+  baseline-finding (internal/boxdns/dns_manager_windows.go:246); gofmt -l
+  изменённых файлов чист; `git diff --check` чист; remediation-набор 17
+  тестов `-count=50` ok (850 прогонов, 0 отказов); `go test . -count=20`
+  ok (69 × 20); `go test ./...` — ThroneCore/internal/xray/internal/xraydns
+  ok, winipcfg — те же 8 средовых отказов (baseline); protobuf-регенерация
+  protoc 31.1 byte-identical (e0e15c6e…ee1ad1bd, 7cd45efa…aae93f),
+  `libcore.proto` не менялся; check_no_updater.sh — BLOCKED как
+  acceptance-evidence (статический grep exit 0, GUI-сборки нет); `go test
+  -race` — BLOCKED (без C-компилятора); настоящий SCM/VM lifecycle —
+  BLOCKED.
+- [PC-100/PC-110] Статус: **BLOCKED** не изменился (VM evidence); Gate 0/1
+  открыты; в кодовую базу изменений не коммитилось — дерево остаётся
+  uncommitted поверх `bfd79c58` до решения владельца.
+
+## PC-110 remediation round 3 — 2026-09-13 (F7: bounded shutdown vs in-flight Start)
+
+Базис — uncommitted remediation поверх `bfd79c58`. Основание:
+независимое ревью (GPT 5.6) подтвердило новый дефект в фиксе round 2 —
+P2 (availability, только авторизованный клиент; не P1: нужен owner/
+Administrators через ACL пайпа + token identity, граница не пересечена,
+воздействие — задержка Stop, а не пост-`Stopped` runtime или обход
+политики). Суть: round 2 держал `serviceRuntimeMu` поперёк всего
+`ServiceStart → legacy Start` (Xray create/start, `boxmain.Create` с
+TUN), а стоп-путь брал тот же лок без timeout — до bounded 2s wait.
+Медленное/зависшее создание неограниченно задерживало SCM Stop/`Stopped`
+вопреки задокументированному bounded shutdown; доставленная отмена
+игнорировалась (legacy `Start` свой `ctx` не читает); тест с паузой до
+лока эту цепочку не покрывал.
+
+- [PC-110] Фикс — только `service_windows.go` (`server.go`/`dispatch.go`/
+  policy/`libcore.proto` не тронуты, GUI-child байт-в-байт): все секции
+  под `serviceRuntimeMu` — O(1) флаг/счётчик, лок никогда не держится
+  поперёк делегации → взятие марки не может зависнуть. `ServiceStart`
+  зеркалит марку pre-check (после марки — отказ, sink не достигается) и
+  post-check (завершился после марки — идемпотентный teardown своим
+  `globalServer.Stop` + отказ `errServiceStopping` → code 7). На один
+  Start: отказ-до-создания либо создал-и-сам-снёс; персистентного
+  пост-`Stopped` runtime нет (транзиентный self-teardown после bounded
+  wait — задокументирован). Вложенности локов нет нигде — deadlock
+  исключён. `Execute` сбрасывает барьер на старте запуска (липкая марка
+  больше не травит in-process рестарт); шов `serviceStartDelegate` +
+  счётчик `serviceRuntimeStarting`.
+- [PC-110] Tests: +2 в `service_lifecycle_windows_test.go` (теперь 19):
+  `TestServiceExecuteStopBoundedWithStartInsideCreation` (реальный
+  Execute + winio pipe, Start внутри делегации: Stop завершается при
+  заблокированном создании, Stopped за ~2 с, elapsed < 10 с; после
+  релиза — self-teardown, нет box/Xray/extra, admission/счётчик в нуле,
+  бюджет цел) и `TestServiceStartPostCheckRefusesAfterMark` (прямой юнит:
+  марка посреди создания, «успешная» делегация без sink → строго
+  `errServiceStopping` + маппинг в code 7). Мутация: на старой семантике
+  (лок поперёк делегации) Execute-тест падает за 15 с с F7-сообщением —
+  проверено, откачено. Старый suspended-Start тест сохранён и зелёный.
+- [PC-110] Checks (эта машина, Go 1.27.0, CI-теги,
+  `-ldflags=-checklinkname=0`): build exit 0; `go vet .` — только прежний
+  baseline-finding dns_manager_windows.go:246; gofmt изменённых файлов
+  чист; `git diff --check` чист; `go test . -count=1` ok (71 тест,
+  0 отказов); защищённые файлы (`server.go`, `dispatch.go`, policy,
+  `libcore.proto`) — `git diff HEAD` пуст; `go test -race` и
+  check_no_updater.sh — BLOCKED как раньше; SCM/VM — BLOCKED.
+- [PC-100/PC-110] Статус: **BLOCKED** не изменился (только VM evidence);
+  Gate 0/1 открыты; коммитов не создавалось — дерево uncommitted поверх
+  `bfd79c58` до решения владельца.
+- [PC-100 VM mini] Добивка того же дня (round 6 mini): текущее дерево
+  (с F7) пересобрано в той же VM, SCM-цикл перепрогнан — create/start
+  (LocalSystem, pipe present)/stop 0s/start/dup-stop 1062/delete/query
+  1060, всё PASS. Артефакты:
+  `D:\GLM_project\vm-evidence\evidence-package\round6-mini\`. sha сборки
+  байт-в-байт совпал с основной (`81D1A4D9…47`) — ранняя сборка уже
+  содержала F7-дерево, формулировка «round 2» в манифесте была неточной.
+  Инциденты (чистка GLM снесла тулчейн, `/rl HIGHEST` запрещён из
+  guestcontrol, VM была погашена посреди прогона — поднята заново)
+  зафиксированы в ROUND6-MINI-NOTES.md. Коммитов не создавалось.
+
 ## 2026-09-13 (продолжение) — VM-evidence прогон выполнен
 
 - [PC-100 VM] Владелец выбрал одноразовую VM и включил SVM в BIOS. Прогон сделан в

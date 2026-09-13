@@ -16,6 +16,7 @@ package main
 
 import (
 	"ThroneCore/gen"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -531,11 +532,13 @@ func startRealPipeService(t *testing.T) {
 	conns := newConnSet()
 	stopCh := make(chan struct{})
 	done := make(chan struct{})
+	serveCtx, cancelServeCtx := context.WithCancel(context.Background())
 	go func() {
 		defer close(done)
-		serveServiceListener(listener, conns, stopCh)
+		serveServiceListener(serveCtx, listener, conns, stopCh, newServiceHandlerGate())
 	}()
 	t.Cleanup(func() {
+		cancelServeCtx()
 		close(stopCh)
 		_ = listener.Close()
 		conns.closeAll()
