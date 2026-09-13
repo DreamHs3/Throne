@@ -9,6 +9,7 @@ package main
 import (
 	"ThroneCore/gen"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"io"
 	"log"
@@ -100,6 +101,87 @@ func TestRunModeFromArgs(t *testing.T) {
 		if got := runModeFromArgs(c.args); got != c.want {
 			t.Errorf("runModeFromArgs(%v) = %v, want %v", c.args, got, c.want)
 		}
+	}
+}
+
+func TestServiceConnectionSetIsGloballyBounded(t *testing.T) {
+	conns := newConnSet()
+	var clients []net.Conn
+	defer func() {
+		conns.closeAll()
+		for _, client := range clients {
+			_ = client.Close()
+		}
+	}()
+
+	for i := 0; i < serviceMaxConnections; i++ {
+		serverConn, clientConn := net.Pipe()
+		clients = append(clients, clientConn)
+		if !conns.tryAdd(serverConn) {
+			t.Fatalf("connection %d rejected below the global limit", i)
+		}
+	}
+	extraServer, extraClient := net.Pipe()
+	defer extraServer.Close()
+	defer extraClient.Close()
+	if conns.tryAdd(extraServer) {
+		t.Fatal("connection above the global limit must be rejected")
+	}
+}
+
+func TestServiceFrameLimitRejectsBeforePayloadRead(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := readServiceRequest(context.Background(), serverConn, false)
+		errCh <- err
+	}()
+
+	var header [6]byte
+	binary.LittleEndian.PutUint16(header[4:], uint16(len("Start")))
+	if _, err := clientConn.Write(header[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clientConn.Write([]byte("Start")); err != nil {
+		t.Fatal(err)
+	}
+	var payloadLength [4]byte
+	binary.LittleEndian.PutUint32(payloadLength[:], serviceMaxPayloadLen+1)
+	if _, err := clientConn.Write(payloadLength[:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errCh; err == nil || !strings.Contains(err.Error(), "payload too large") {
+		t.Fatalf("oversized frame must be rejected before its body is read, got %v", err)
+	}
+}
+
+func TestServicePartialFrameGetsDeadline(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	previous := serviceReadTimeout
+	serviceReadTimeout = 20 * time.Millisecond
+	defer func() { serviceReadTimeout = previous }()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := readServiceRequest(context.Background(), serverConn, true)
+		errCh <- err
+	}()
+	if _, err := clientConn.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("a one-byte frame prefix must time out")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a one-byte frame prefix stalled without a deadline")
 	}
 }
 

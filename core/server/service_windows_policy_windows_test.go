@@ -94,6 +94,17 @@ func TestServiceConfigPolicyRejections(t *testing.T) {
 	}
 }
 
+func TestServiceConfigPolicyAcceptsTransportPaths(t *testing.T) {
+	for _, doc := range []string{
+		`{"outbounds":[{"type":"vless","transport":{"type":"ws","path":"/ws"}}]}`,
+		`{"dns":{"servers":[{"type":"https","server":"dns.example","path":"/dns-query"}]}}`,
+	} {
+		if _, err := applyServiceConfigPolicy(doc, ""); err != nil {
+			t.Fatalf("ordinary network path must remain valid: %s: %v", doc, err)
+		}
+	}
+}
+
 // A disabled cache_file must have its client-supplied path silently dropped:
 // no error, and the normalized document must not contain the path at all.
 func TestServiceConfigPolicyDropsDisabledCacheFilePath(t *testing.T) {
@@ -200,6 +211,12 @@ func TestServiceXrayConfigPolicy(t *testing.T) {
 		`{"log":{"access":"C:\\xray\\access.log","loglevel":"warning"}}`,
 		`{"log":{"error":"C:\\xray\\error.log"}}`,
 		`{"inbounds":[{"port":443,"streamSettings":{"tlsSettings":{"certificates":[{"certificateFile":"C:\\cert.pem","keyFile":"C:\\key.pem"}]}}}]}`,
+		`{"outbounds":[{"streamSettings":{"security":"tls","tlsSettings":{"masterKeyLog":"C:\\Windows\\Temp\\keys.log"}}}]}`,
+		`{"outbounds":[{"streamSettings":{"security":"tls","tlsSettings":{"masterKeyLog":"NONE"}}}]}`,
+		`{"outbounds":[{"streamSettings":{"security":"reality","realitySettings":{"masterKeyLog":"relative.keys"}}}]}`,
+		`{"geodata":{"cron":"* * * * *","assets":[{"url":"https://example.com/geo.dat","file":"geoip.dat"}]}}`,
+		`{"env":{"XRAY_LOCATION_ASSET":"C:\\Windows\\Temp"}}`,
+		`{"inbounds":[{"streamSettings":{"network":"hysteria","hysteriaSettings":{"masquerade":{"type":"file","dir":"C:\\Windows"}}}}]}`,
 		`{"route":{"external_ui":"C:\\ui"}}`,
 		`{"inbounds":[{"listen":"unix:///tmp/x.sock"}]}`,
 		`{"inbounds":[{"listen":"\\\\.\\pipe\\evil"}]}`,
@@ -217,6 +234,8 @@ func TestServiceXrayConfigPolicy(t *testing.T) {
 		`{"log":{"loglevel":"warning"}}`,
 		`{"log":{"access":"none","error":"none"}}`,
 		`{"log":{"access":"","error":""}}`,
+		`{"outbounds":[{"streamSettings":{"security":"tls","tlsSettings":{"masterKeyLog":"none"}}}]}`,
+		`{"outbounds":[{"streamSettings":{"network":"ws","wsSettings":{"path":"/ordinary-websocket"}}}]}`,
 		`{"inbounds":[{"port":443}],"outbounds":[{"protocol":"freedom"}]}`,
 	}
 	for _, doc := range accepted {
@@ -411,6 +430,11 @@ func TestServiceSDDLValidation(t *testing.T) {
 		"D:P(A;;GA;;;S-1-5-11)",                 // Authenticated Users as a raw SID
 		"D:P(A;;GA;;;S-1-5-32-545)",             // Builtin Users as a raw SID
 		"D:P(A;;GA;;;S-1-5-32-546)",             // Builtin Guests as a raw SID
+		"D:P(a;;GA;;;WD)",                       // case-varied ACE type
+		"D:P(A;;GA;;;wd)",                       // case-varied trustee
+		"D:P(A;;GA;;;s-1-1-0)",                  // case-varied raw SID
+		"D:P(OA;;GA;;;WD)",                      // object allow ACE
+		"D:P(A;;GR;;;BG)",                       // Builtin Guests abbreviation
 		"D:P(A;;GA;;;SY)(A;;GA;;;WD)",           // broad trustee behind a valid prefix
 		"D:P(A;;GA;;;SY)(A;;GA;;;S-1-5-32-545)", // broad raw SID behind a valid prefix
 		"D:(A;;GA;;;SY)",                        // DACL without the protected flag
@@ -421,6 +445,18 @@ func TestServiceSDDLValidation(t *testing.T) {
 		if _, err := safeServiceSDDL(sddl); err == nil || !strings.HasPrefix(err.Error(), errInvalidRequest) {
 			t.Errorf("safeServiceSDDL(%q) must be rejected with %s, got %v", sddl, errInvalidRequest, err)
 		}
+	}
+}
+
+func TestTokenGroupAttributes(t *testing.T) {
+	if !tokenGroupEnabled(windows.SE_GROUP_ENABLED) {
+		t.Fatal("an enabled token group must remain eligible")
+	}
+	if tokenGroupEnabled(windows.SE_GROUP_ENABLED | windows.SE_GROUP_USE_FOR_DENY_ONLY) {
+		t.Fatal("a deny-only token group must not authorize a client")
+	}
+	if tokenGroupEnabled(0) {
+		t.Fatal("a disabled token group must not authorize a client")
 	}
 }
 

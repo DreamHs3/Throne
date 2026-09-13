@@ -9,17 +9,11 @@ Supports Windows 11/10/8/7 / Linux / MacOS out of the box.
 ### Note on MacOS releases
 Apple platforms have a very strict security policy and since Throne does not have a signed certificate, you will have to remove the quarantine using `xattr -d com.apple.quarantine /path/to/throne.app`. Move `Throne.app` to `/Applications` before the first launch — the built-in privilege escalation opens `Terminal` to make the core setuid-root, and that step can fail while the app is still inside `~/Downloads`.
 
-### GitHub Releases (Portable ZIP)
+### Releases and Linux installation
 
-[![GitHub All Releases](https://img.shields.io/github/downloads/throneproj/Throne/total?label=downloads-total&logo=github&style=flat-square)](https://github.com/throneproj/Throne/releases)
-
-# Linux CLI installer
-```bash
-curl -fsSL https://raw.githubusercontent.com/throneproj/Throne/dev/script/install_linux.py | sudo python3
-```
-
-### RPM repository
-[Throne RPM repository](https://parhelia512.github.io/) for Fedora/RHEL and openSUSE/SLE.
+ProxyCore does not yet have an authenticated binary release channel. The
+automated Linux installer and upstream release links are disabled; build from
+this checkout instead.
 
 ## Supported protocols
 
@@ -41,6 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/throneproj/Throne/dev/script/instal
 - ShadowTLS
 - Wireguard
 - AmneziaWG
+- MASQUE
 - SSH
 - Xray VLESS
 - Custom Outbound (Both Sing-box and Xray)

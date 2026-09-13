@@ -11,6 +11,7 @@ package main
 
 import (
 	"ThroneCore/gen"
+	"ThroneCore/internal/xray"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -27,6 +28,7 @@ import (
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/tailscale/go-winio"
+	"golang.org/x/sync/semaphore"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"google.golang.org/protobuf/proto"
@@ -45,13 +47,20 @@ const (
 
 	// Wire-level sanity guards for the new service path only; the formal
 	// frame/request limit contract arrives with PC-110.
-	serviceMaxMethodLen  = 4096
-	serviceMaxPayloadLen = 32 << 20
+	serviceMaxMethodLen   = 4096
+	serviceMaxPayloadLen  = 32 << 20
+	serviceMaxConnections = 16
+	servicePayloadBudget  = 64 << 20
 
-	// Bound on concurrently executing handlers per connection; the formal
-	// bounded-concurrency contract (including a global bound) is PC-110.
+	// Handler concurrency is bounded both per connection and across the
+	// service, so opening many authenticated connections cannot multiply the
+	// privileged runtime's work without limit.
 	serviceHandlerConcurrencyPerConn = 8
+	serviceHandlerConcurrencyGlobal  = 16
 )
+
+var serviceReadTimeout = 30 * time.Second
+var serviceWriteTimeout = 30 * time.Second
 
 // The service pipe protocol version; incompatible clients get a typed error.
 const serviceProtocolVersion = 1
@@ -127,20 +136,48 @@ var broadSDDLTrusteeSIDs = map[string]string{
 // unsafe override fails the listener start - never a silent fallback to
 // something broader.
 func safeServiceSDDL(sddl string) (string, error) {
-	if !strings.HasPrefix(sddl, "D:P") {
+	sd, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		return "", fmt.Errorf("%s: invalid service SDDL: %v", errInvalidRequest, err)
+	}
+	canonical := sd.String()
+	if !strings.HasPrefix(canonical, "D:P") {
 		return "", fmt.Errorf("%s: service SDDL must start with a protected DACL (D:P)", errInvalidRequest)
 	}
-	for _, trustee := range []string{"WD", "AN", "AU", "BU"} {
-		if sddlGrantsTrustee(sddl, trustee) {
-			return "", fmt.Errorf("%s: service SDDL must not grant access to %s", errInvalidRequest, trustee)
-		}
+	rest := strings.TrimPrefix(canonical, "D:P")
+	if rest == "" {
+		return "", fmt.Errorf("%s: service SDDL must contain an access-control entry", errInvalidRequest)
 	}
-	for _, trustee := range sddlACETrustees(sddl) {
-		if label, broad := broadSDDLTrusteeSIDs[trustee]; broad {
-			return "", fmt.Errorf("%s: service SDDL must not grant access to %s (raw SID %s)", errInvalidRequest, label, trustee)
+	for rest != "" {
+		if rest[0] != '(' {
+			return "", fmt.Errorf("%s: unsupported service SDDL section", errInvalidRequest)
 		}
+		end := strings.IndexByte(rest, ')')
+		if end < 0 {
+			return "", fmt.Errorf("%s: malformed service SDDL ACE", errInvalidRequest)
+		}
+		fields := strings.Split(rest[1:end], ";")
+		if len(fields) != 6 {
+			return "", fmt.Errorf("%s: unsupported service SDDL ACE", errInvalidRequest)
+		}
+		aceType := strings.ToUpper(fields[0])
+		if aceType != "A" && aceType != "D" {
+			return "", fmt.Errorf("%s: unsupported service SDDL ACE type %q", errInvalidRequest, fields[0])
+		}
+		if aceType == "A" {
+			trustee := strings.ToUpper(fields[5])
+			if label, broad := broadSDDLTrusteeSIDs[trustee]; broad {
+				return "", fmt.Errorf("%s: service SDDL must not grant access to %s (%s)", errInvalidRequest, label, trustee)
+			}
+			for _, broad := range []string{"WD", "AN", "AU", "BU", "BG"} {
+				if trustee == broad {
+					return "", fmt.Errorf("%s: service SDDL must not grant access to %s", errInvalidRequest, trustee)
+				}
+			}
+		}
+		rest = rest[end+1:]
 	}
-	return sddl, nil
+	return canonical, nil
 }
 
 // sddlACETrustees returns the trustee field of every allow ACE in the SDDL
@@ -209,10 +246,14 @@ type connSet struct {
 
 func newConnSet() *connSet { return &connSet{m: make(map[net.Conn]struct{})} }
 
-func (cs *connSet) add(c net.Conn) {
+func (cs *connSet) tryAdd(c net.Conn) bool {
 	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if len(cs.m) >= serviceMaxConnections {
+		return false
+	}
 	cs.m[c] = struct{}{}
-	cs.mu.Unlock()
+	return true
 }
 
 func (cs *connSet) remove(c net.Conn) {
@@ -232,6 +273,8 @@ func (cs *connSet) closeAll() {
 // serviceHandlersWG tracks in-flight handler goroutines across all
 // connections so shutdown can wait for them in a bounded way.
 var serviceHandlersWG sync.WaitGroup
+var serviceHandlerSlots = make(chan struct{}, serviceHandlerConcurrencyGlobal)
+var servicePayloadSlots = semaphore.NewWeighted(servicePayloadBudget)
 
 // waitServiceHandlers waits up to d for in-flight handlers to finish.
 func waitServiceHandlers(d time.Duration) {
@@ -249,6 +292,15 @@ func waitServiceHandlers(d time.Duration) {
 // serveServiceListener is the accept loop. Every client is authorized by
 // token identity before it can reach the handshake, let alone a method.
 func serveServiceListener(listener net.Listener, conns *connSet, stopCh <-chan struct{}) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-stopCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -265,10 +317,13 @@ func serveServiceListener(listener net.Listener, conns *connSet, stopCh <-chan s
 			_ = conn.Close()
 			continue
 		}
-		conns.add(conn)
+		if !conns.tryAdd(conn) {
+			_ = conn.Close()
+			continue
+		}
 		go func() {
 			defer conns.remove(conn)
-			serveServiceConn(conn)
+			serveServiceConnContext(ctx, conn)
 		}()
 	}
 }
@@ -377,9 +432,16 @@ func tokenGroupSIDs(buf []byte) []string {
 	members := unsafe.Slice((*windows.SIDAndAttributes)(unsafe.Pointer(&info.Groups[0])), info.GroupCount)
 	var out []string
 	for _, member := range members {
+		if !tokenGroupEnabled(member.Attributes) {
+			continue
+		}
 		out = append(out, member.Sid.String())
 	}
 	return out
+}
+
+func tokenGroupEnabled(attributes uint32) bool {
+	return attributes&windows.SE_GROUP_ENABLED != 0 && attributes&windows.SE_GROUP_USE_FOR_DENY_ONLY == 0
 }
 
 // tokenInformation queries a token information class into a fresh buffer.
@@ -443,19 +505,40 @@ func (h *proxyCoreServiceHandler) Execute(args []string, r <-chan svc.ChangeRequ
 }
 
 type serviceRequest struct {
-	id      uint32
-	method  string
-	payload []byte
+	id            uint32
+	method        string
+	payload       []byte
+	payloadWeight int64
 }
 
 // readServiceRequest parses the same little-endian frame layout as
 // runDispatch: [u32 reqId][u16 methodLen][method][u32 payloadLen][payload].
 // Duplicated on purpose so dispatch.go stays untouched (ADR-002); PC-110
 // replaces both with the versioned envelope reader.
-func readServiceRequest(conn net.Conn) (serviceRequest, error) {
+func readServiceRequest(ctx context.Context, conn net.Conn, allowIdle bool) (serviceRequest, error) {
 	var req serviceRequest
+	if !allowIdle {
+		if err := conn.SetReadDeadline(time.Now().Add(serviceReadTimeout)); err != nil {
+			return req, err
+		}
+	}
 	var head [4]byte
-	if _, err := io.ReadFull(conn, head[:]); err != nil {
+	if allowIdle {
+		// Established clients may remain idle indefinitely. The first byte starts
+		// a frame; the rest must then arrive before the deadline.
+		if _, err := io.ReadFull(conn, head[:1]); err != nil {
+			return req, err
+		}
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(serviceReadTimeout)); err != nil {
+		return req, err
+	}
+	defer conn.SetReadDeadline(time.Time{}) //nolint:errcheck -- a later I/O reports connection errors
+	if allowIdle {
+		if _, err := io.ReadFull(conn, head[1:]); err != nil {
+			return req, err
+		}
+	} else if _, err := io.ReadFull(conn, head[:]); err != nil {
 		return req, err
 	}
 	req.id = binary.LittleEndian.Uint32(head[:])
@@ -482,12 +565,26 @@ func readServiceRequest(conn net.Conn) (serviceRequest, error) {
 	if payloadLen > serviceMaxPayloadLen {
 		return req, fmt.Errorf("%s: payload too large: %d", errInvalidRequest, payloadLen)
 	}
+	if payloadLen > 0 {
+		if err := servicePayloadSlots.Acquire(ctx, int64(payloadLen)); err != nil {
+			return req, err
+		}
+		req.payloadWeight = int64(payloadLen)
+	}
 	payload := make([]byte, payloadLen)
 	if _, err := io.ReadFull(conn, payload); err != nil {
+		releaseServicePayload(&req)
 		return req, err
 	}
 	req.payload = payload
 	return req, nil
+}
+
+func releaseServicePayload(req *serviceRequest) {
+	if req.payloadWeight > 0 {
+		servicePayloadSlots.Release(req.payloadWeight)
+		req.payloadWeight = 0
+	}
 }
 
 // writeServiceResponse mirrors runDispatch's response framing. mu is optional
@@ -501,6 +598,10 @@ func writeServiceResponse(mu *sync.Mutex, conn net.Conn, reqId uint32, status ui
 		mu.Lock()
 		defer mu.Unlock()
 	}
+	if err := conn.SetWriteDeadline(time.Now().Add(serviceWriteTimeout)); err != nil {
+		return err
+	}
+	defer conn.SetWriteDeadline(time.Time{}) //nolint:errcheck -- a later I/O reports connection errors
 	if _, err := conn.Write(header[:]); err != nil {
 		return err
 	}
@@ -514,13 +615,18 @@ func writeServiceResponse(mu *sync.Mutex, conn net.Conn, reqId uint32, status ui
 // serveServiceConn handles one client connection. A disconnect is a normal
 // service-mode event: unlike runDispatch, it never terminates the process.
 func serveServiceConn(conn net.Conn) {
+	serveServiceConnContext(context.Background(), conn)
+}
+
+func serveServiceConnContext(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 
 	// Mandatory versioned handshake before any other method.
-	req, err := readServiceRequest(conn)
+	req, err := readServiceRequest(ctx, conn, false)
 	if err != nil {
 		return
 	}
+	defer releaseServicePayload(&req)
 	if req.method != "Hello" {
 		_ = writeServiceResponse(nil, conn, req.id, 1,
 			[]byte(fmt.Sprintf("%s: first request must be Hello", errNoHandshake)))
@@ -547,11 +653,12 @@ func serveServiceConn(conn net.Conn) {
 	if err := writeServiceResponse(nil, conn, req.id, 0, hsResp); err != nil {
 		return
 	}
+	releaseServicePayload(&req)
 
 	var writeMu sync.Mutex
 	sem := make(chan struct{}, serviceHandlerConcurrencyPerConn)
 	for {
-		req, err := readServiceRequest(conn)
+		req, err := readServiceRequest(ctx, conn, true)
 		if err != nil {
 			// Client went away or sent garbage: close and move on.
 			return
@@ -559,28 +666,45 @@ func serveServiceConn(conn net.Conn) {
 		if req.method == "Hello" {
 			_ = writeServiceResponse(&writeMu, conn, req.id, 1,
 				[]byte(fmt.Sprintf("%s: handshake already complete", errInvalidRequest)))
+			releaseServicePayload(&req)
 			continue
 		}
-		sem <- struct{}{}
 		serviceHandlersWG.Add(1)
-		go func(id uint32, method string, pl []byte) {
+		select {
+		case serviceHandlerSlots <- struct{}{}:
+		case <-ctx.Done():
+			serviceHandlersWG.Done()
+			releaseServicePayload(&req)
+			return
+		}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			<-serviceHandlerSlots
+			serviceHandlersWG.Done()
+			releaseServicePayload(&req)
+			return
+		}
+		go func(request serviceRequest) {
 			defer serviceHandlersWG.Done()
 			defer func() { <-sem }()
+			defer func() { <-serviceHandlerSlots }()
+			defer releaseServicePayload(&request)
 			defer func() {
 				if r := recover(); r != nil {
 					// Same stack parity as runDispatch: a panic must be diagnosable.
-					log.Printf("panic in %s: %v\n%s", method, r, runtimeDebug.Stack())
-					_ = writeServiceResponse(&writeMu, conn, id, 1,
-						[]byte(fmt.Sprintf("core panic in %s: %v", method, r)))
+					log.Printf("panic in %s: %v\n%s", request.method, r, runtimeDebug.Stack())
+					_ = writeServiceResponse(&writeMu, conn, request.id, 1,
+						[]byte(fmt.Sprintf("core panic in %s: %v", request.method, r)))
 				}
 			}()
-			respData, dispatchErr := dispatchService(method, pl)
+			respData, dispatchErr := dispatchService(request.method, request.payload)
 			if dispatchErr != nil {
-				_ = writeServiceResponse(&writeMu, conn, id, 1, []byte(dispatchErr.Error()))
+				_ = writeServiceResponse(&writeMu, conn, request.id, 1, []byte(dispatchErr.Error()))
 			} else {
-				_ = writeServiceResponse(&writeMu, conn, id, 0, respData)
+				_ = writeServiceResponse(&writeMu, conn, request.id, 0, respData)
 			}
-		}(req.id, req.method, req.payload)
+		}(req)
 	}
 }
 
@@ -630,6 +754,9 @@ func (s *server) ServiceCheckConfig(ctx context.Context, in *gen.LoadConfigReq) 
 	for _, full := range in.GetXrayFullConfigs() {
 		if err := validateServiceXrayConfigPolicy(full); err != nil {
 			return nil, err
+		}
+		if err := xray.CheckXrayConfig(full); err != nil {
+			return &gen.ErrorResp{Error: To(err.Error())}, nil
 		}
 	}
 	return globalServer.CheckConfig(ctx, in)

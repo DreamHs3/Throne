@@ -33,14 +33,15 @@ namespace ProxyCore::Storage {
             return QString::fromLatin1(hash.result().toHex());
         }
 
+        bool snapshotSqliteIntoStaging(const QDir& source, const QDir& staging,
+                                       const QString& rel, QString* error);
+
         // Copies sourceDir -> stagingDir, returning relative paths of staged
         // files. Never writes inside sourceDir.
         //
         // SQLite databases are not plain-copied: a running Throne keeps them
-        // in WAL mode, so a byte copy can be torn and its committed state can
-        // live in the -wal sidecar. Each *.db is instead copied to
-        // "<name>.raw" together with its sidecars, opened read-write so
-        // SQLite recovers the WAL *in our copy*, and replaced by a
+        // in WAL mode, so a byte copy can be torn and committed state can live
+        // in the WAL. Each *.db is read through SQLite's Online Backup API and produces a
         // consistent Online Backup snapshot — the same WAL-safe pattern as
         // Database::backupSelective (src/database/Database.cpp).
         bool copyIntoStaging(const QDir& source, const QDir& staging, QStringList* relPaths, QString* error) {
@@ -76,37 +77,22 @@ namespace ProxyCore::Storage {
             return true;
         }
 
-        // Replaces a plain-copied live database with a consistent snapshot in
-        // the staging directory. The plain copy ("<rel>.raw") plus the
-        // renamed -wal/-shm sidecars is opened read-write so SQLite recovers
-        // a hot WAL there, then the Online Backup API writes a clean
-        // database under the final name. Raw artifacts are always removed.
+        // Reads the live source database through SQLite and writes a consistent
+        // Online Backup snapshot into staging. SQLite coordinates the snapshot
+        // with an active WAL writer; copying the database and sidecars as
+        // independent files would have a race between those copies.
         bool snapshotSqliteIntoStaging(const QDir& source, const QDir& staging, const QString& rel, QString* error) {
-            const QString rawPath = staging.absoluteFilePath(rel + ".raw");
-            for (const auto suffix : { "-wal", "-shm" }) {
-                const QString sourceSidecar = source.absoluteFilePath(rel + suffix);
-                if (QFileInfo::exists(sourceSidecar) && !QFile::copy(sourceSidecar, rawPath + suffix)) {
-                    *error = QObject::tr("cannot copy %1").arg(rel + suffix);
-                    return false;
-                }
-            }
-
             bool ok = false;
             try {
-                // Opening the raw copy recovers the WAL sidecar; the source
-                // database itself is never opened or written here.
-                SQLite::Database raw(rawPath.toStdString(), SQLite::OPEN_READWRITE);
+                SQLite::Database live(source.absoluteFilePath(rel).toStdString(), SQLite::OPEN_READONLY);
                 SQLite::Database snapshot(staging.absoluteFilePath(rel).toStdString(),
                                           SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE);
-                SQLite::Backup backup(snapshot, raw);
+                SQLite::Backup backup(snapshot, live);
                 backup.executeStep(-1);
                 ok = true;
             } catch (const std::exception& e) {
                 *error = QObject::tr("cannot snapshot %1: %2").arg(rel, QString::fromUtf8(e.what()));
             }
-            QFile::remove(rawPath);
-            QFile::remove(rawPath + "-wal");
-            QFile::remove(rawPath + "-shm");
             return ok;
         }
     }

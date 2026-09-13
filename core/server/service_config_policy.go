@@ -63,7 +63,6 @@ func configServiceDataDir() string {
 // values as files.
 var configPolicyDenyKeys = map[string]bool{
 	"output":                      true, // sing-box log.output (and any unknown sink)
-	"path":                        true, // local/predefined rule-sets, hosts file, misc
 	"paths":                       true,
 	"initial_path":                true, // remote rule-set initial cache file
 	"cache_path":                  true, // ssmapi experimental service
@@ -131,7 +130,10 @@ func applyServiceConfigPolicy(coreConfigJSON string, serviceDataDir string) (str
 	if err := normalizeServiceCoreConfig(root, serviceDataDir); err != nil {
 		return "", fmt.Errorf("%s: %v", errConfigPolicy, err)
 	}
-	if err := scanConfigPolicy(root, "$", ""); err != nil {
+	if err := scanSingBoxFilesystemPolicy(root, "$", false, false, false); err != nil {
+		return "", fmt.Errorf("%s: %v", errConfigPolicy, err)
+	}
+	if err := scanConfigPolicy(root, "$", "", true); err != nil {
 		return "", fmt.Errorf("%s: %v", errConfigPolicy, err)
 	}
 
@@ -140,6 +142,63 @@ func applyServiceConfigPolicy(coreConfigJSON string, serviceDataDir string) (str
 		return "", fmt.Errorf("%s: %v", errConfigPolicy, err)
 	}
 	return string(normalized), nil
+}
+
+// scanSingBoxFilesystemPolicy distinguishes filesystem-bearing `path` fields
+// from ordinary URL paths used by WebSocket, HTTP, HTTPUpgrade and DNS HTTPS.
+func scanSingBoxFilesystemPolicy(node interface{}, where string, inRuleSet bool, inNetworkNamespaces bool, inLegacyGeo bool) error {
+	switch value := node.(type) {
+	case map[string]interface{}:
+		objectType, _ := lookupMapString(value, "type")
+		for key, child := range value {
+			childWhere := where + "." + key
+			childInRuleSet := inRuleSet || strings.EqualFold(key, "rule_set")
+			childInNetworkNamespaces := inNetworkNamespaces || strings.EqualFold(key, "network_namespaces")
+			childInLegacyGeo := inLegacyGeo || (strings.EqualFold(lastPathSegment(where), "route") &&
+				(strings.EqualFold(key, "geoip") || strings.EqualFold(key, "geosite")))
+			if strings.EqualFold(key, "path") && stringOrListHasNonEmpty(child) {
+				filesystemPath := childInNetworkNamespaces || childInLegacyGeo ||
+					(childInRuleSet && strings.EqualFold(objectType, "local")) || strings.EqualFold(objectType, "hosts")
+				if filesystemPath {
+					return fmt.Errorf("%s: filesystem path is not permitted in service configs", childWhere)
+				}
+			}
+			if err := scanSingBoxFilesystemPolicy(child, childWhere, childInRuleSet, childInNetworkNamespaces, childInLegacyGeo); err != nil {
+				return err
+			}
+		}
+	case []interface{}:
+		for i, child := range value {
+			if err := scanSingBoxFilesystemPolicy(child, fmt.Sprintf("%s[%d]", where, i), inRuleSet, inNetworkNamespaces, inLegacyGeo); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func lookupMapString(value map[string]interface{}, wanted string) (string, bool) {
+	for key, child := range value {
+		if strings.EqualFold(key, wanted) {
+			text, ok := child.(string)
+			return text, ok
+		}
+	}
+	return "", false
+}
+
+func stringOrListHasNonEmpty(value interface{}) bool {
+	switch typed := value.(type) {
+	case string:
+		return typed != ""
+	case []interface{}:
+		for _, item := range typed {
+			if text, ok := item.(string); ok && text != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // validateServiceXrayConfigPolicy applies the rejection rules to an Xray
@@ -157,8 +216,55 @@ func validateServiceXrayConfigPolicy(xrayConfigJSON string) error {
 		// the strict parser rejects; anything unscannable is rejected.
 		return fmt.Errorf("%s: not valid strict JSON: %v", errConfigPolicy, err)
 	}
-	if err := scanConfigPolicy(root, "$", ""); err != nil {
+	if err := scanXrayFilesystemPolicy(root, "$", false, false); err != nil {
 		return fmt.Errorf("%s: %v", errConfigPolicy, err)
+	}
+	if err := scanConfigPolicy(root, "$", "", true); err != nil {
+		return fmt.Errorf("%s: %v", errConfigPolicy, err)
+	}
+	return nil
+}
+
+// scanXrayFilesystemPolicy covers Xray-only file fields without rejecting
+// unrelated generic "file" keys in sing-box documents. masterKeyLog="none"
+// is Xray's documented disabled sentinel and remains a legitimate value.
+func scanXrayFilesystemPolicy(node interface{}, where string, insideGeodata bool, insideMasquerade bool) error {
+	switch value := node.(type) {
+	case map[string]interface{}:
+		for key, child := range value {
+			childWhere := where + "." + key
+			childInGeodata := insideGeodata || strings.EqualFold(key, "geodata")
+			childInMasquerade := insideMasquerade || strings.EqualFold(key, "masquerade")
+			if where == "$" && strings.EqualFold(key, "env") {
+				if env, ok := child.(map[string]interface{}); ok && len(env) > 0 {
+					return fmt.Errorf("%s: Xray environment overrides are not permitted in service configs", childWhere)
+				}
+			}
+			if strings.EqualFold(key, "masterKeyLog") {
+				if path, ok := child.(string); ok && path != "" && path != "none" {
+					return fmt.Errorf("%s: Xray master key log files are not permitted in service configs", childWhere)
+				}
+			}
+			if childInGeodata && strings.EqualFold(key, "file") {
+				if path, ok := child.(string); ok && path != "" {
+					return fmt.Errorf("%s: Xray geodata asset files are not permitted in service configs", childWhere)
+				}
+			}
+			if childInMasquerade && strings.EqualFold(key, "dir") {
+				if path, ok := child.(string); ok && path != "" {
+					return fmt.Errorf("%s: Xray masquerade directories are not permitted in service configs", childWhere)
+				}
+			}
+			if err := scanXrayFilesystemPolicy(child, childWhere, childInGeodata, childInMasquerade); err != nil {
+				return err
+			}
+		}
+	case []interface{}:
+		for i, child := range value {
+			if err := scanXrayFilesystemPolicy(child, fmt.Sprintf("%s[%d]", where, i), insideGeodata, insideMasquerade); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -312,14 +418,14 @@ func configPolicyValueDenied(value string) bool {
 // experimental.cache_file.path (any case spelling — normalization owns them
 // all, and every spelling it does not own has been deleted by the time the
 // scan runs).
-func scanConfigPolicy(node interface{}, where string, parentKey string) error {
+func scanConfigPolicy(node interface{}, where string, parentKey string, allowGenericPath bool) error {
 	switch value := node.(type) {
 	case map[string]interface{}:
 		for key, child := range value {
-			if err := scanConfigPolicy(child, where+"."+key, key); err != nil {
+			if err := scanConfigPolicy(child, where+"."+key, key, allowGenericPath); err != nil {
 				return err
 			}
-			if !configPolicyKeyDenied(key) {
+			if !configPolicyKeyDenied(key) && (allowGenericPath || !strings.EqualFold(key, "path")) {
 				continue
 			}
 			// The normalized cache_file path is service-owned (this is the
@@ -355,7 +461,7 @@ func scanConfigPolicy(node interface{}, where string, parentKey string) error {
 		}
 	case []interface{}:
 		for i, item := range value {
-			if err := scanConfigPolicy(item, fmt.Sprintf("%s[%d]", where, i), parentKey); err != nil {
+			if err := scanConfigPolicy(item, fmt.Sprintf("%s[%d]", where, i), parentKey, allowGenericPath); err != nil {
 				return err
 			}
 		}

@@ -36,4 +36,17 @@ for dir in script .github/workflows; do
     fi
 done
 
+# Fork isolation also applies to installers and packaging: a script that
+# downloads the upstream Throne application is just as unsafe as bundling its
+# updater binary. Keep this check independent from the word "updater".
+for path in README.md CMakeLists.txt cmake script .github/workflows; do
+    if grep -rIn -E 'throneproj/(Throne|updater)(/releases|/dev|\.git)?' "$path" >/dev/null 2>&1; then
+        echo "FAIL: upstream Throne release/install source found in $path:"
+        grep -rIn -E 'throneproj/(Throne|updater)(/releases|/dev|\.git)?' "$path"
+        status=1
+    else
+        echo "ok: upstream Throne release/install source absent from $path"
+    fi
+done
+
 exit "$status"
