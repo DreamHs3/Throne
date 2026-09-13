@@ -12,6 +12,10 @@
 #include <utility>
 
 #include <3rdparty/SQLiteCpp/include/SQLiteCpp.h>
+// NOTE: the vendored umbrella header does not pull in Backup.h (unlike
+// upstream SQLiteCpp), so include it directly. Backup.cpp is compiled
+// into the target, only the declaration was missing.
+#include <3rdparty/SQLiteCpp/include/Backup.h>
 
 namespace ProxyCore::Storage {
 
@@ -46,7 +50,8 @@ namespace ProxyCore::Storage {
         // Database::backupSelective (src/database/Database.cpp).
         bool copyIntoStaging(const QDir& source, const QDir& staging, QStringList* relPaths, QString* error) {
             QDirIterator it(source.absolutePath(),
-                            QDir::Files | QDir::Hidden | QDir::NoDotAndDotDot | QDir::Subdirectories);
+                            QDir::Files | QDir::Hidden | QDir::NoDotAndDotDot,
+                            QDirIterator::Subdirectories);
             while (it.hasNext()) {
                 const QString abs = it.next();
                 const QString rel = QDir::fromNativeSeparators(source.relativeFilePath(abs));
