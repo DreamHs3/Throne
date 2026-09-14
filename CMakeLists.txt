@@ -649,5 +649,9 @@ qt_finalize_executable(Throne)
 # ProxyCore test harnesses (PC-010/PC-030); OFF keeps the upstream build identical.
 option(PROXYCORE_BUILD_TESTS "Build ProxyCore test harnesses" OFF)
 if (PROXYCORE_BUILD_TESTS)
+    # At top level so the root CTestTestfile links the tests/proxycore suite
+    # (enable_testing() in the subdirectory alone leaves `ctest` from the
+    # build root with "No tests were found").
+    enable_testing()
     add_subdirectory(tests/proxycore)
 endif ()
