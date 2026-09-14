@@ -504,6 +504,54 @@ TUN), а стоп-путь брал тот же лок без timeout — до b
   guestcontrol, VM была погашена посреди прогона — поднята заново)
   зафиксированы в ROUND6-MINI-NOTES.md. Коммитов не создавалось.
 
+## Gate 0 C++ leg — закрыта реальной сборкой (2026-09-13, GitHub Actions)
+
+Форк `DreamHs3/Throne`, ветка `agent/night-stage1-service-spike`,
+workflow «Throne build matrix», run `34779991199` (tag `v0.0.0-pc020-check`,
+publish пуст — релиза нет). Итог: **все 9 build-go + все 11 build-cpp
+SUCCESS** (включая `windows-latest` + Qt 6.11.2 + MSVC), Pack
+windows/macos/debug SUCCESS. Pack linux-amd64/arm64 FAILED — артефакт
+синтетического тега (дефисы/подчёркивания в версии ломают dpkg/rpm-парсинг),
+не дефект кода; для C++-ноги (Windows GUI) нерелевантно.
+
+По пути CI нашёл и закрыл 3 latent compile-blind дефекта PC-010
+(локально C++ не собирается, поэтому жили незамеченными):
+`6ba6411a` (попытка include-пути — неверная теория, откачена),
+`d58dae7c` (стиль инклуда под плоский вендор),
+`ebb29bda` (`QDirIterator` 3-арг форма + прямой `Backup.h`: зонтичный
+`SQLiteCpp.h` вендора его не тянет). Все — build-only, без изменения
+поведения. Ветка `agent/pc120-installer` срезана раньше этих коммитов —
+подтянуть merge-ем перед её финишем.
+
+PC-020 доказана на реальном артефакте
+(`Pack-ebb29bdadb5409d6f1220f40191fe1141ab27adc-windows`,
+инсталлер sha256 `FC0D8ABB…397`, `Throne.exe` sha256 `956BA1C0…FD64`):
+- Состав пакета: `Throne.exe`, `ThroneCore.exe`, `libcronet.dll` —
+  `updater.exe` отсутствует.
+- Бинарный скан (`updater\.exe`, `RunUpdater`,
+  `throneproj/Throne/releases`, `DownloadAsset`+`Throne.zip`): все
+  запрещённые паттерны check_no_updater.sh ОТСУТСТВУЮТ в обоих exe и в
+  инсталлере. `DownloadAsset` в GUI — generic-хелпер
+  `Configs_network::NetworkRequestHelper` (RTTI-имена); `releases/latest`
+  — только geoip/geosite-рулы (v2fly); `squirrel` — имена geosite-рул;
+  `updater`-строки ThroneCore.exe — символы сторонних Go-зависимостей
+  (RuleSetUpdater, tailscale, gVisor, grpc) и MaxMind-строки.
+- `MainWindow::CheckUpdate()` (`mainwindow_system.cpp:428`) — ноль сети:
+  только инфо-бокс «updates are not available yet»; пункт меню оставлен
+  включённым сознательно (объясняет). `on_menu_exit_triggered` updater
+  не запускает (только self-restart).
+- Эквивалент check_no_updater.sh по исходникам/скриптам/CI: всё PASS.
+- Ручной импорт профилей: код импорта не тронут PC-020 (только updater-
+  пути); GUI-функционал импорта в CI не кликался — честная граница
+  проверки, deny-by-construction: импорт не ходит в сеть за релизами.
+
+ЗАМЕЧАНИЕ ДЛЯ PC-120-РЕВЬЮ (не блокер здесь):
+`on_menu_exit_triggered` (`mainwindow_system.cpp:163-170`) для
+`RestartWithTun`/`RestartWithDns` по-прежнему зовёт
+`WinCommander::runProcessElevated` — это production restart-as-admin
+путь, НЕ покрытый handoff-pc120.md (там только `main.cpp:352` и диалог
+`get_elevated_permissions`). PC-120 должен закрыть и его.
+
 ## 2026-09-13 (продолжение) — VM-evidence прогон выполнен
 
 - [PC-100 VM] Владелец выбрал одноразовую VM и включил SVM в BIOS. Прогон сделан в
@@ -529,3 +577,57 @@ TUN), а стоп-путь брал тот же лок без timeout — до b
   (2026-09-13)» в pc-100-report.md). Gate 0/1 НЕ объявляются закрытыми (C++-нога Gate 0
   compile-blind, формальное закрытие — решение владельца). Дерево PC-110-ремедиации
   по-прежнему uncommitted поверх `bfd79c58` — данный коммит только документация.
+
+## Gate 0 — CLOSED 2026-09-14 (owner-authorized, с записанными исключениями)
+
+Чек-лист закрытия (final-report §13 / morning-review §5):
+
+1. §3.1 компиляция — PASS: CI run 34779991199 (`DreamHs3/Throne`) 11/11 build-cpp
+   (включая windows-amd64, `[65/65] Linking Throne.exe`; предупреждения — только
+   предсуществующие C4834/AutoUic/node-шум, `C4100`/unused-`reason` нет — проверено
+   по полному логу `ci-run-34779991199.log`, 26243 строки, `ctest` в нём: 0) +
+   VM-сборки baseline `21b8f680` и pc120-дерева (GUI-BASELINE-REPORT §1, sha256).
+2. §3.1 ctest — PASS 3/3 в VM 2026-09-14 (`PC100-Evidence`, MSVC 2022 + CMake
+   3.30.6 + Ninja 1.12.1 + Qt 6.11.2, задача schtasks `pcctest`, полный токен):
+   `proxycore_migration` 0.13s, `proxycore_characterization` 0.06s,
+   `proxycore_parser_fixtures` 5.09s, все `100% tests passed`.
+   Лог: `D:\GLM_project\vm-evidence\evidence-package\ctest\ctest_run.log`.
+   Рецепт: `cmake -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+   -DPROXYCORE_BUILD_TESTS=ON ..` + `ninja proxycore_tests
+   proxycore_characterization proxycore_parser_fixtures` + три вызова `ctest -R`
+   (по одному на тест — alternation-regex через `call` разрывается cmd-парсером).
+   Дерево прогона: `agent/night-stage1-service-spike` @ `ebb29bda` + uncommitted
+   (PC-120: `.iss`/`main.cpp`/`mainwindow_system.cpp` — в harness не линкуются,
+   на тесты не влияют; harness-фиксы ниже; `status.md` второго агента).
+   По пути в harness найдено и исправлено 17 latent compile-blind дефектов
+   (ТОЛЬКО `tests/` + `enable_testing()` в корне `CMakeLists.txt`, production
+   не тронут): scope путей `sources_app_core.cmake` (root-relative вместо
+   `tests/proxycore` + unquoted-`REMOVE_ITEM` + `QV2RAY_RC`/`.ui`-крайности);
+   дублирующийся `main` → split на 2 exe; `QDirIterator::Subdirectories`-class
+   ошибки компиляции тестов (`C2666`→`.toArray()`, macro-brace parens,
+   `get_simple_rules` через публичный `ResetSimpleRule`, `auto& repo`,
+   `SQLiteCpp.h` root-relative include); линковка (masque.cpp в список,
+   `myproto` link+include, mainwindow-moc SKIP + bare `staticMetaObject`,
+   `API::Client` стабы); семантика сравнений (`QJsonValue`, adblock-индекс
+   0→2 по коду, byte-identity→logical для Backup, ssh-userinfo known defect).
+   Guard-тест (`bash`) в VM не гонялся (нет bash) — покрыт grep-эквивалентом
+   на хосте: чисто.
+3. §3.2 — отчёт flash `gui-baseline/GUI-BASELINE-REPORT.md` (+81 файл) принят
+   с исключениями: D1 baseline-дефект (кандидат в upstream-репорт, базу не
+   патчить); TUN не достигнут (честный FAIL; legacy-путь демонтируется PC-120);
+   D2 принят как known issue → follow-up `D:\GLM_project\handoff-pc010-D2.md`
+   (bbolt-`cache.db`, тихая ошибка, непривинченный rollback); uninstall-изоляция
+   BLOCKED до PC-120 шага 5.
+4. Ревью диффов PC-010/PC-020 — выполнено, замечаний по скоупу/терминологии
+   нет (вердикт записан владельцу 2026-09-14).
+
+Переносимые исключения (не скрыты): D1, D2 (+задача), TUN, rollback-gap,
+uninstall-изоляция до шага 5.
+
+ЯВНО НЕ ЗАКРЫТ: Gate 1 (нужен envelope-over-SCM VM top-up для PC-110).
+
+Провенанс-уточнение: в flash-отчёте «working copy of agent/pc120-installer» —
+фактически рабочая копия `night-stage1-service-spike` + uncommitted выше;
+`agent/pc120-installer` чист на `09aa116c`, перенос PC-120 туда — отдельное
+ожидающее решение. Harness-фиксы коммитятся отдельно (см. ниже); PC-120-файлы
+и пуш — только по решению владельца.
