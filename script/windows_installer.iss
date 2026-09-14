@@ -66,6 +66,19 @@ Name: "{autodesktop}\ProxyCore"; Filename: "{app}\Throne.exe"
 Root: HKA; Subkey: "Software\ProxyCore"; ValueType: string; ValueName: "InstallPath"; ValueData: "{app}"; Flags: uninsdeletekey
 
 [Run]
+; PC-120: the service is demand-started by the UI, never by Setup. The
+; Environment grant written by SetupServiceEnv lives under the service's
+; registry key, so it must run after sc.exe created the service — hence
+; AfterInstall on the entry below, not CurStepChanged/ssPostInstall:
+; non-postinstall [Run] entries are processed BEFORE ssPostInstall fires,
+; so a literal ssPostInstall placement would run the icacls entry below
+; BEFORE the data folder exists (silent no-op, exit code ignored) and leave
+; it unhardened. AfterInstall chains create -> env+mkdir -> icacls
+; deterministically. (Call-site deviation from handoff step 1.2, see ADR.)
+Filename: "{sys}\sc.exe"; Parameters: "create ProxyCoreService binPath= ""{app}\ThroneCore.exe service"" start= demand"; Flags: runhidden; Check: IsAdminInstallMode; AfterInstall: SetupServiceEnv
+; PC-120: the service data folder must be SYSTEM+Administrators only, so
+; inheritance from ProgramData is removed.
+Filename: "{sys}\icacls.exe"; Parameters: """{commonappdata}\ProxyCore"" /inheritance:r /grant:r SYSTEM:(OI)(CI)F /grant:r *S-1-5-32-544:(OI)(CI)F"; Flags: runhidden; Check: IsAdminInstallMode
 Filename: "{app}\Throne.exe"; Description: "{cm:LaunchProgram,ProxyCore}"; Flags: postinstall nowait skipifsilent
 
 [Code]
@@ -110,11 +123,73 @@ begin
       'Choose a different folder, or restart Setup and choose to install for all users.', mbError, MB_OK, IDOK);
 end;
 
+// PC-120: fills in the per-user service grant (THRONE_SERVICE_*), then
+// creates the service data folder BEFORE the icacls [Run] entry below runs
+// (icacls needs an existing folder). Runs only in admin install mode (via
+// the sc.exe entry's AfterInstall — a skipped entry never fires it) and
+// strictly after the service exists — HKLM\SYSTEM\...\Services\ProxyCoreService
+// cannot be written before sc create. Any failure aborts Setup: a silent
+// skip would leave the service without a grant, which is worse than no
+// service at all.
+procedure SetupServiceEnv;
+var
+  User, TmpFile, Sid, DataDir, PsParams: String;
+  SidRaw: AnsiString;
+  ResultCode: Integer;
+begin
+  User := GetUserNameString;
+  TmpFile := ExpandConstant('{tmp}\ownersid.txt');
+  // Windows PowerShell 5.1 exits 0 even after non-terminating errors, so
+  // ErrorActionPreference=Stop is what makes the ResultCode <> 0 checks
+  // below actually fire on failure.
+  PsParams := '-NoProfile -Command "$ErrorActionPreference = ''Stop''; (Get-LocalUser -Name ''' + User +
+    ''').Sid.Value | Out-File -FilePath ''' + TmpFile + ''' -Encoding ascii"';
+  if not Exec('powershell.exe', PsParams, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+  begin
+    SuppressibleMsgBox('Could not determine the SID of the installing user (PowerShell exit code ' + IntToStr(ResultCode) + ').', mbError, MB_OK, IDOK);
+    RaiseException('SetupServiceEnv: SID lookup failed');
+  end;
+  if not LoadStringFromFile(TmpFile, SidRaw) then
+  begin
+    SuppressibleMsgBox('Could not read the installing user''s SID from the temporary file.', mbError, MB_OK, IDOK);
+    RaiseException('SetupServiceEnv: SID file read failed');
+  end;
+  Sid := Trim(SidRaw);
+  if Sid = '' then
+  begin
+    SuppressibleMsgBox('Could not determine the SID of the installing user "' + User + '".', mbError, MB_OK, IDOK);
+    RaiseException('SetupServiceEnv: empty SID');
+  end;
+  DataDir := ExpandConstant('{commonappdata}\ProxyCore');
+  // Same command shape as the VM evidence round 2: REG_MULTI_SZ under the
+  // service's Environment key, applied by stopping/starting the service —
+  // here the service simply starts on demand later.
+  PsParams := '-NoProfile -Command "$ErrorActionPreference = ''Stop''; Set-ItemProperty -Path ''HKLM:\SYSTEM\CurrentControlSet\Services\ProxyCoreService'' -Name Environment -Type MultiString -Value @(''THRONE_SERVICE_SDDL=D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;' + Sid + ''')'',''THRONE_SERVICE_ALLOWED_SIDS=' + Sid + ''',''THRONE_SERVICE_DATA_DIR=' + DataDir + ''')"';
+  if not Exec('powershell.exe', PsParams, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+  begin
+    SuppressibleMsgBox('Could not write the ProxyCoreService environment (PowerShell exit code ' + IntToStr(ResultCode) + ').', mbError, MB_OK, IDOK);
+    RaiseException('SetupServiceEnv: Environment write failed');
+  end;
+  if not ForceDirectories(DataDir) then
+  begin
+    SuppressibleMsgBox('Could not create the service data folder "' + DataDir + '".', mbError, MB_OK, IDOK);
+    RaiseException('SetupServiceEnv: data folder creation failed');
+  end;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep <> ssPostInstall then
     Exit;
   DeleteFile(ExpandConstant('{app}\uninstall.exe'));
+end;
+
+// PC-120: non-admin installs run without the service; say so on the Finish page.
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if (CurPageID = wpFinished) and (not IsAdminInstallMode) then
+    WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
+      'Service not installed — reinstall as administrator for service mode.';
 end;
 
 procedure StopThrone;
@@ -156,12 +231,19 @@ end;
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   App: String;
+  ResultCode: Integer;
 begin
   App := ExpandConstant('{app}');
   if CurUninstallStep = usUninstall then
   begin
+    // PC-120: stop and delete the service before killing leftover processes.
+    // Results are ignored — the service may not exist (non-admin install).
+    // The service's Environment key is removed by Windows together with the
+    // service itself, it is never touched separately.
+    Exec(ExpandConstant('{sys}\sc.exe'), 'stop ProxyCoreService', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Exec(ExpandConstant('{sys}\sc.exe'), 'delete ProxyCoreService', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     StopThrone;
-    DeleteUserData := SuppressibleMsgBox('Also delete your ProxyCore profiles, settings and logs?' + #13#10#13#10 +
+    DeleteUserData := SuppressibleMsgBox('Also delete your ProxyCore profiles, settings and logs, including the service data folder?' + #13#10#13#10 +
       'Choose No if you plan to reinstall ProxyCore later and want to keep them.', mbConfirmation, MB_YESNO, IDYES) = IDYES;
   end
   else if (CurUninstallStep = usPostUninstall) and DeleteUserData then
@@ -173,6 +255,8 @@ begin
     // <AppData>\Throne is never touched.
     DelTree(ExpandConstant('{localappdata}\ProxyCore\config'), True, True, True);
     RemoveDir(ExpandConstant('{localappdata}\ProxyCore'));
+    // PC-120: the service data folder, if the user opted to remove it.
+    DelTree(ExpandConstant('{commonappdata}\ProxyCore'), True, True, True);
     RemoveDir(App);
   end;
 end;
