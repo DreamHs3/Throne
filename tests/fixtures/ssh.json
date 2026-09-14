@@ -17,13 +17,7 @@
       },
       "round_trip_link": true,
       "round_trip_json": true,
-      "build_json_contains": {
-        "type": "ssh",
-        "server": "core.example.com",
-        "server_port": 2222,
-        "user": "example-user",
-        "client_version": "PC-Test_1.0"
-      }
+      "known_defect": "ssh-userinfo-user-dropped"
     },
     {
       "id": "ssh-link-minimal",

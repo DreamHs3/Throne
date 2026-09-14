@@ -13,7 +13,9 @@
 #include <QStandardPaths>
 #include <QTemporaryDir>
 
-#include <SQLiteCpp/SQLiteCpp.h>
+// Repo-root-relative include (same convention as the app target since the
+// vendored tree is flat: headers live directly in 3rdparty/SQLiteCpp/include).
+#include <3rdparty/SQLiteCpp/include/SQLiteCpp.h>
 
 #include "include/proxycore/storage/ThroneMigration.h"
 
@@ -75,7 +77,11 @@ namespace {
         CHECK(QFile::exists(target.filePath("config/profiles.json")));
         CHECK(QFile::exists(target.filePath("config/sub/urls.txt")));
         CHECK(QFile::exists(target.filePath(".hidden-marker")));
-        CHECK(hashFile(target.filePath("throne.db")) == hashFile(source.filePath("throne.db")));
+        // Byte identity across SQLite::Backup is NOT expected: the backup API
+        // rewrites header bookkeeping (change counter et al.), so the snapshot
+        // is logically — not physically — identical. Logical equivalence is
+        // pinned by markerRowReadable() below; the manifest records the
+        // target-side hashes rollback actually consumes.
         CHECK(QDir(target.filePath("migration-staging")).exists() == false);
 
         // Manifest written last, listing every copied file.

@@ -52,7 +52,7 @@ namespace {
             r.process_name << "chrome.exe";
             r.outboundID = proxyID;
             auto j = toJson(r);
-            CHECK(j["process_name"] == QJsonArray{"chrome.exe"});
+            CHECK(j["process_name"].toArray() == QJsonArray{"chrome.exe"});
             CHECK(j["action"] == "route");
             // forView=false without a tag serializes the outbound as the raw int id.
             CHECK(j["outbound"] == -1);
@@ -62,14 +62,14 @@ namespace {
             r.process_path << "C:/Program Files/Google/Chrome/chrome.exe";
             r.outboundID = directID;
             auto j = toJson(r);
-            CHECK(j["process_path"] == QJsonArray{"C:/Program Files/Google/Chrome/chrome.exe"});
+            CHECK(j["process_path"].toArray() == QJsonArray{"C:/Program Files/Google/Chrome/chrome.exe"});
             CHECK(j["outbound"] == -2);
         }
         {
             RouteRule r;
             r.process_path_regex << "^C:/Program Files/.*chrome\\.exe$";
             auto j = toJson(r);
-            CHECK(j["process_path_regex"] == QJsonArray{"^C:/Program Files/.*chrome\\.exe$"});
+            CHECK(j["process_path_regex"].toArray() == QJsonArray{"^C:/Program Files/.*chrome\\.exe$"});
         }
         // domain family
         {
@@ -79,10 +79,10 @@ namespace {
             r.domain_keyword << "akamai";
             r.domain_regex << ".*\\.example\\.org";
             auto j = toJson(r);
-            CHECK(j["domain"] == QJsonArray{"example.com"});
-            CHECK(j["domain_suffix"] == QJsonArray{"steamcontent.com"});
-            CHECK(j["domain_keyword"] == QJsonArray{"akamai"});
-            CHECK(j["domain_regex"] == QJsonArray{".*\\.example\\.org"});
+            CHECK(j["domain"].toArray() == QJsonArray{"example.com"});
+            CHECK(j["domain_suffix"].toArray() == QJsonArray{"steamcontent.com"});
+            CHECK(j["domain_keyword"].toArray() == QJsonArray{"akamai"});
+            CHECK(j["domain_regex"].toArray() == QJsonArray{".*\\.example\\.org"});
         }
         // destination IP/CIDR + private shortcuts + source
         {
@@ -92,9 +92,9 @@ namespace {
             r.source_ip_cidr << "198.51.100.7/32";
             r.source_ip_is_private = false;
             auto j = toJson(r);
-            CHECK(j["ip_cidr"] == QJsonArray{"203.0.113.0/24", "2001:db8::/32"});
+            CHECK((j["ip_cidr"].toArray() == QJsonArray{"203.0.113.0/24", "2001:db8::/32"}));
             CHECK(j["ip_is_private"] == true);
-            CHECK(j["source_ip_cidr"] == QJsonArray{"198.51.100.7/32"});
+            CHECK(j["source_ip_cidr"].toArray() == QJsonArray{"198.51.100.7/32"});
             // false booleans are omitted, not written.
             CHECK(j.contains("source_ip_is_private") == false);
         }
@@ -106,10 +106,10 @@ namespace {
             r.source_port << "53";
             r.source_port_range << "60000:61000";
             auto j = toJson(r);
-            CHECK(j["port"] == QJsonArray{443, 8080});
-            CHECK(j["port_range"] == QJsonArray{"1000:2000"});
-            CHECK(j["source_port"] == QJsonArray{53});
-            CHECK(j["source_port_range"] == QJsonArray{"60000:61000"});
+            CHECK((j["port"].toArray() == QJsonArray{443, 8080}));
+            CHECK(j["port_range"].toArray() == QJsonArray{"1000:2000"});
+            CHECK(j["source_port"].toArray() == QJsonArray{53});
+            CHECK(j["source_port_range"].toArray() == QJsonArray{"60000:61000"});
         }
         // network / protocol / ip_version / invert
         {
@@ -227,7 +227,7 @@ namespace {
             CHECK(QRegularExpression("\\d+$").match(name).hasMatch());
             // View/share form preserves the raw URL.
             auto jv = toJson(r, true);
-            CHECK(jv["rule_set"] == QJsonArray{"https://example.com/geosite-steam.srs"});
+            CHECK(jv["rule_set"].toArray() == QJsonArray{"https://example.com/geosite-steam.srs"});
         }
         // share json carries name + stable type token.
         {
@@ -272,8 +272,24 @@ namespace {
     // ---- RouteProfile -------------------------------------------------------
 
     void testRouteProfile() {
-        // get_simple_rules: the full simple-rule table with actions/outbounds.
-        const auto simple = RouteProfile::get_simple_rules();
+        // Template simple-rule table (12 rows) with actions/outbounds.
+        // get_simple_rules() itself is a private static factory, so it is
+        // exercised through the public ResetSimpleRule(), which appends the
+        // template row for a missing type on a fresh profile.
+        RouteProfile tmpl;
+        tmpl.ResetSimpleRule(simpleAddressProxy);
+        tmpl.ResetSimpleRule(simpleAddressBypass);
+        tmpl.ResetSimpleRule(simpleAddressBlock);
+        tmpl.ResetSimpleRule(simpleProcessNameProxy);
+        tmpl.ResetSimpleRule(simpleProcessNameBypass);
+        tmpl.ResetSimpleRule(simpleProcessNameBlock);
+        tmpl.ResetSimpleRule(simpleProcessPathProxy);
+        tmpl.ResetSimpleRule(simpleProcessPathBypass);
+        tmpl.ResetSimpleRule(simpleProcessPathBlock);
+        tmpl.ResetSimpleRule(simpleAddressWarpBypass);
+        tmpl.ResetSimpleRule(simpleProcessNameWarpBypass);
+        tmpl.ResetSimpleRule(simpleProcessPathWarpBypass);
+        const auto& simple = tmpl.Rules;
         CHECK(simple.size() == 12);
         for (const auto& rule : simple) {
             if (rule->type == simpleAddressBlock || rule->type == simpleProcessNameBlock || rule->type == simpleProcessPathBlock) {
@@ -327,22 +343,24 @@ namespace {
         CHECK(rulesJson.size() == 3);
         if (rulesJson.size() == 3) {
             CHECK(rulesJson.at(0).toObject()["action"] == "hijack-dns");
-            CHECK(rulesJson.at(1).toObject()["process_path"] == QJsonArray{"C:/apps/test-client.exe"});
-            CHECK(rulesJson.at(2).toObject()["process_path"] == QJsonArray{"C:/Program Files/Steam/steam.exe"});
+            CHECK(rulesJson.at(1).toObject()["process_path"].toArray() == QJsonArray{"C:/apps/test-client.exe"});
+            CHECK(rulesJson.at(2).toObject()["process_path"].toArray() == QJsonArray{"C:/Program Files/Steam/steam.exe"});
             CHECK(rulesJson.at(1).toObject()["action"] == "reject");
             CHECK(rulesJson.at(2).toObject()["outbound"] == -2);
         }
 
         // adblock: enabled setting injects one reject rule before the first
-        // route-action rule (service rule ordering contract).
+        // route-action rule (service rule ordering contract). Here that is
+        // index 2: hijack-dns and reject render first, third-direct renders
+        // action "route" (default action, outbound directID).
         const bool adblockOriginal = dataManager->settingsRepo->adblock_enable;
         dataManager->settingsRepo->adblock_enable = true;
         const auto withAdblock = profile.get_route_rules(false);
         dataManager->settingsRepo->adblock_enable = adblockOriginal;
         CHECK(withAdblock.size() == 4);
         if (withAdblock.size() == 4) {
-            CHECK(withAdblock.at(0).toObject()["rule_set"] == QJsonArray{"throne-adblocksingbox"});
-            CHECK(withAdblock.at(0).toObject()["action"] == "reject");
+            CHECK(withAdblock.at(2).toObject()["rule_set"].toArray() == QJsonArray{"throne-adblocksingbox"});
+            CHECK(withAdblock.at(2).toObject()["action"] == "reject");
         }
 
         // A profile with no route-action rules still gets the adblock rule at the end.
@@ -359,14 +377,14 @@ namespace {
         dataManager->settingsRepo->adblock_enable = adblockOriginal;
         CHECK(tailAdblock.size() == 2);
         if (tailAdblock.size() == 2) {
-            CHECK(tailAdblock.at(1).toObject()["rule_set"] == QJsonArray{"throne-adblocksingbox"});
+            CHECK(tailAdblock.at(1).toObject()["rule_set"].toArray() == QJsonArray{"throne-adblocksingbox"});
         }
     }
 
     // ---- RoutesRepo persistence round-trip ---------------------------------
 
     void testRoutesRepoRoundTrip() {
-        auto repo = dataManager->routesRepo;
+        auto& repo = dataManager->routesRepo;
 
         // Create, persist, reload, compare the compiled rule projection.
         auto profile = std::make_shared<RouteProfile>();
