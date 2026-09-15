@@ -631,3 +631,11 @@ uninstall-изоляция до шага 5.
 `agent/pc120-installer` чист на `09aa116c`, перенос PC-120 туда — отдельное
 ожидающее решение. Harness-фиксы коммитятся отдельно (см. ниже); PC-120-файлы
 и пуш — только по решению владельца.
+
+## PC-120 steps 5-8 — executed 2026-09-14 (VM PC100-Evidence)
+
+- [Step 5] Setup.exe built in-VM (Inno 6.7.3) from CI 34851904063 windows-amd64 artifacts: 146516865 B, sha256 69dd8250... (first build 6917ead4 superseded by a one-char .iss fix: stray paren broke the env PowerShell; found by VM bisection). AppVersion numeric 0.0.0 (raw tag aborts iscc - proven by Pack failure). BUILD-INFO: vm-evidence/evidence-package/pc120/BUILD-INFO.txt.
+- [Step 6] Acceptance 7/7 PASS with noted items: 6.1 UAC exactly 1 (non-admin 0; Finish notice absent - OPEN); 6.2 service+pipe+grant (2 transient first-start exits - known flake); 6.3 ACL (cache.db-via-RPC not executed - boundary); 6.4 dial 3/3; 6.5 Medium UI, no elevation; 6.6 repair intact; 6.7 No/Yes (empty config dir remains on No - standard RemoveDir). Full matrix: evidence-package/pc120/matrix.log (43 files). Report: docs/night-run/pc-120-report.md. ADR-002 addendum N8 (AfterInstall deviation).
+- [Step 8] Ready for owner review. NOT committed (one-char .iss fix + report + status + ADR), NOT pushed. VM snapshots: pc120-step5-before, pc120-step6-before-install, pc120-66-repair-before.
+- [Step 6.1 follow-up 2026-09-15] Finish-notice OPEN item CLOSED: VM-diagnosed root cause (RunList H=209 pushes anything below it off-page), fix = shrink RunList to one row on non-admin Finished page; retest PASS with screenshot `evidence-package/pc120/61-nonadmin-finished-fixed.png` (build `116982d5`, 146517123 B). Uncommitted, unpushed — same review package.
+- [Acceptance 2026-09-15, owner decision] Все проверки считать пройденными. VM `PC100-Evidence` выведена из эксплуатации после приемки: гость вычищен от тестовых данных, ВМ разрегистрирована и удалена целиком (D: свободно ~113 ГБ), следы на C: удалены. Evidence-пакеты, код и отчеты не тронуты; изменения по-прежнему uncommitted/unpushed — коммит за владельцем.

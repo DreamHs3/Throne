@@ -84,6 +84,14 @@ Filename: "{app}\Throne.exe"; Description: "{cm:LaunchProgram,ProxyCore}"; Flags
 [Code]
 var
   DeleteUserData: Boolean;
+  // PC-120: standalone notice label on the Finish page (non-admin installs).
+  // Appending to FinishedLabel does NOT render: the label rect in WizardStyle
+  // modern clips overflowing lines. A dedicated word-wrapped label is used
+  // instead; the RunList checklist is full-height (209px at 768p, VM-proven)
+  // with a single item, so it is shrunk to one row first — otherwise anything
+  // anchored below it lands off-page (the exact "caption set but invisible"
+  // symptom of both previous attempts).
+  ServiceNoticeLabel: TNewStaticText;
 
 // No legacy Throne lookup here: ProxyCore must never install into (or
 // upgrade over) a Throne installation.
@@ -164,7 +172,7 @@ begin
   // Same command shape as the VM evidence round 2: REG_MULTI_SZ under the
   // service's Environment key, applied by stopping/starting the service —
   // here the service simply starts on demand later.
-  PsParams := '-NoProfile -Command "$ErrorActionPreference = ''Stop''; Set-ItemProperty -Path ''HKLM:\SYSTEM\CurrentControlSet\Services\ProxyCoreService'' -Name Environment -Type MultiString -Value @(''THRONE_SERVICE_SDDL=D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;' + Sid + ''')'',''THRONE_SERVICE_ALLOWED_SIDS=' + Sid + ''',''THRONE_SERVICE_DATA_DIR=' + DataDir + ''')"';
+  PsParams := '-NoProfile -Command "$ErrorActionPreference = ''Stop''; Set-ItemProperty -Path ''HKLM:\SYSTEM\CurrentControlSet\Services\ProxyCoreService'' -Name Environment -Type MultiString -Value @(''THRONE_SERVICE_SDDL=D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;' + Sid + ''',''THRONE_SERVICE_ALLOWED_SIDS=' + Sid + ''',''THRONE_SERVICE_DATA_DIR=' + DataDir + ''')"';
   if not Exec('powershell.exe', PsParams, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
   begin
     SuppressibleMsgBox('Could not write the ProxyCoreService environment (PowerShell exit code ' + IntToStr(ResultCode) + ').', mbError, MB_OK, IDOK);
@@ -185,11 +193,33 @@ begin
 end;
 
 // PC-120: non-admin installs run without the service; say so on the Finish page.
+procedure InitializeWizard();
+begin
+  ServiceNoticeLabel := TNewStaticText.Create(WizardForm);
+  ServiceNoticeLabel.Parent := WizardForm.FinishedPage;
+  ServiceNoticeLabel.Left := WizardForm.FinishedLabel.Left;
+  ServiceNoticeLabel.Width := WizardForm.FinishedLabel.Width;
+  ServiceNoticeLabel.WordWrap := True;
+  ServiceNoticeLabel.Height := ScaleY(40);
+  ServiceNoticeLabel.Caption := '';
+end;
+
 procedure CurPageChanged(CurPageID: Integer);
 begin
   if (CurPageID = wpFinished) and (not IsAdminInstallMode) then
-    WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
-      'Service not installed — reinstall as administrator for service mode.';
+  begin
+    // RunList spans the whole client area (H=209 at 768p) for a single item:
+    // shrink it to one row, the notice takes the freed space (Top ~= 206,
+    // bottom ~= 246 — client bottom is ~= 365, VM-verified geometry).
+    WizardForm.RunList.Height := ScaleY(30);
+    ServiceNoticeLabel.Top := WizardForm.RunList.Top + WizardForm.RunList.Height + ScaleY(8);
+    // ASCII hyphen on purpose: the .iss is UTF-8 without BOM, so a U+2014
+    // em-dash would depend on the guest codepage; the message must render
+    // on any locale.
+    ServiceNoticeLabel.Caption := 'Service not installed - reinstall as administrator for service mode.';
+  end
+  else
+    ServiceNoticeLabel.Caption := '';
 end;
 
 procedure StopThrone;

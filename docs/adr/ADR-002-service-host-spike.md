@@ -486,3 +486,9 @@ baseline-finding dns_manager_windows.go:246; gofmt изменённых файл
 и `check_no_updater.sh` — BLOCKED как раньше (нет C-компилятора /
 C++-тулчейна); настоящий SCM/VM lifecycle — BLOCKED без изменений.
 Протокол — `docs/night-run/pc-110-report.md` §"Remediation round 3 (F7)".
+
+## Addendum №8 (PC-120 — SetupServiceEnv через AfterInstall, а не CurStepChanged/ssPostInstall)
+
+Отклонение от handoff-pc120 шага 1.2 (место вызова SetupServiceEnv) — обоснованное, не упрощение. Порядок Inno доказан по документации и исходникам: не-postinstall записи [Run] обрабатываются ДО срабатывания CurStepChanged(ssPostInstall). Буквальное исполнение плана (env+mkdir в ssPostInstall) запускало бы [Run]-icacls ДО создания каталога (тихий no-op, код выхода игнорируется) и оставляло каталог данных незахарденным — провал приёмки 6.3.
+
+Принято: AfterInstall на sc.exe-записи [Run] даёт детерминированную цепочку create → env+mkdir → icacls; в non-admin режиме запись skipped и процедура не вызывается. Проверено VM-приёмкой PC-120 7/7 (матрица + BUILD-INFO в vm-evidence/evidence-package/pc120/). Попутно: PowerShell-команды используют $ErrorActionPreference=Stop (иначе abort-путь мёртв — PS 5.1 выходит 0) и Out-File -Encoding ascii (редирект > даёт UTF-16LE, нечитаемый для LoadStringFromFile).
