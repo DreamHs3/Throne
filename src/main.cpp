@@ -1,4 +1,5 @@
 #include <csignal>
+#include <cstdio>
 #include <memory>
 
 #include <QApplication>
@@ -294,6 +295,9 @@ int main(int argc, char* argv[]) {
     // PC-010: `-migrate-from-throne [path]` imports a COPY of a Throne data
     // directory into our own. The source is only read, never modified; the
     // manifest written on success enables exact rollback.
+    // PC-010-D2: the result is logged before Logging::Init, so the message
+    // would be invisible on the console — duplicate it to stderr. Failure
+    // stays non-fatal (warn), only visibility changes.
     if (arguments.contains("-migrate-from-throne")) {
         QString throneSource = ProxyCore::Storage::DefaultThroneDataDir();
         const int migrateIndex = arguments.indexOf("-migrate-from-throne");
@@ -305,9 +309,32 @@ int main(int argc, char* argv[]) {
             LOG_INFO(QString("migrated %1 files (%2 bytes) from %3; manifest: %4")
                          .arg(migrated.filesCopied).arg(migrated.bytesCopied)
                          .arg(throneSource, migrated.manifestPath));
+            std::fprintf(stderr, "proxycore: migrated %d files (%lld bytes) from %s; manifest: %s\n",
+                         migrated.filesCopied, static_cast<long long>(migrated.bytesCopied),
+                         throneSource.toUtf8().constData(), migrated.manifestPath.toUtf8().constData());
         } else {
             LOG_WARN(QString("migration from %1 not performed: %2").arg(throneSource, migrated.error));
+            std::fprintf(stderr, "proxycore: migration from %s not performed: %s\n",
+                         throneSource.toUtf8().constData(), migrated.error.toUtf8().constData());
         }
+        std::fflush(stderr);
+    }
+
+    // PC-010-D2: `-rollback-migration` removes exactly the files recorded in
+    // the migration manifest (foreign files stay). Same non-fatal + stderr
+    // contract as the migration flag above.
+    if (arguments.contains("-rollback-migration")) {
+        const auto rolled = ProxyCore::Storage::RollbackMigration(configDir);
+        if (rolled.ok) {
+            LOG_INFO(QString("rolled back migration in %1: %2 files removed").arg(configDir).arg(rolled.filesRemoved));
+            std::fprintf(stderr, "proxycore: rolled back migration in %s: %d files removed\n",
+                         configDir.toUtf8().constData(), rolled.filesRemoved);
+        } else {
+            LOG_WARN(QString("rollback in %1 not performed: %2").arg(configDir, rolled.error));
+            std::fprintf(stderr, "proxycore: rollback in %s not performed: %s\n",
+                         configDir.toUtf8().constData(), rolled.error.toUtf8().constData());
+        }
+        std::fflush(stderr);
     }
 
     appStartEpoch = QDateTime::currentSecsSinceEpoch();

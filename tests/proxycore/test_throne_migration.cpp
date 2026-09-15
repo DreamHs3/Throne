@@ -219,6 +219,82 @@ namespace {
         return failures;
     }
 
+    // PC-010-D2: a real Throne data dir always contains sing-box's cache.db,
+    // which is bbolt — not SQLite — despite the *.db suffix. The migration
+    // must carry it opaquely (byte-identical, listed in the manifest) instead
+    // of failing with "file is not a database". Rollback must then remove
+    // exactly the manifest files and leave foreign files alone.
+    int testMigrateNonSqliteDbCopiedOpaque() {
+        int failures = 0;
+        QTemporaryDir source;
+        CHECK(source.isValid());
+        // Minimal Throne source: real SQLite throne.db (required marker) +
+        // bbolt-like cache.db (must NOT start with the SQLite magic).
+        {
+            SQLite::Database db(source.filePath("throne.db").toStdString(),
+                                SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE);
+            db.exec("CREATE TABLE marker(v TEXT)");
+            db.exec("INSERT INTO marker VALUES('PC-TEST')");
+        }
+        const QByteArray cacheContent =
+            QByteArray("bbolt-bucket:") + QByteArray("\x00\x01\x02\xff\xfe\x00", 6) +
+            QByteArray(1024, 'C');
+        CHECK(writeFile(source.filePath("cache.db"), cacheContent));
+        const auto cacheHashBefore = hashFile(source.filePath("cache.db"));
+        const auto throneHashBefore = hashFile(source.filePath("throne.db"));
+
+        QTemporaryDir target;
+        CHECK(target.isValid());
+        const auto result = ProxyCore::Storage::MigrateFromThrone(source.path(), target.path());
+        CHECK(result.ok);
+        CHECK(result.error.isEmpty());
+        CHECK(result.filesCopied == 2);
+        CHECK(QFile::exists(target.filePath("throne.db")));
+        CHECK(QFile::exists(target.filePath("cache.db")));
+        // Opaque payload travels byte-identical (unlike the SQLite snapshot,
+        // which rewrites header bookkeeping).
+        CHECK(hashFile(target.filePath("cache.db")) == cacheHashBefore);
+        // Source stays read-only: byte-identical after the run.
+        CHECK(hashFile(source.filePath("cache.db")) == cacheHashBefore);
+        CHECK(hashFile(source.filePath("throne.db")) == throneHashBefore);
+        // The SQLite half is still a readable snapshot.
+        CHECK(markerRowReadable(target.filePath("throne.db"), "PC-TEST"));
+
+        // Manifest lists the opaque cache.db (rollback consumes it).
+        {
+            QFile manifest(target.filePath("migration-manifest.json"));
+            CHECK(manifest.open(QIODevice::ReadOnly));
+            if (manifest.isOpen()) {
+                const auto obj = QJsonDocument::fromJson(manifest.readAll()).object();
+                const auto files = obj["files"].toArray();
+                CHECK(files.size() == 2);
+                bool sawCache = false, sawThrone = false;
+                for (const auto& entry : files) {
+                    const QString p = entry.toObject()["path"].toString();
+                    if (p == QString("cache.db")) sawCache = true;
+                    if (p == QString("throne.db")) sawThrone = true;
+                    CHECK(p.startsWith("..") == false);
+                }
+                CHECK(sawCache);
+                CHECK(sawThrone);
+            }
+        }
+
+        // Foreign files created after migration are not part of the manifest
+        // and must survive the rollback wired to -rollback-migration.
+        CHECK(writeFile(target.filePath("foreign.txt"), "do-not-touch"));
+        const auto rollback = ProxyCore::Storage::RollbackMigration(target.path());
+        CHECK(rollback.ok);
+        CHECK(rollback.filesRemoved == 2);
+        CHECK(QFile::exists(target.filePath("cache.db")) == false);
+        CHECK(QFile::exists(target.filePath("throne.db")) == false);
+        CHECK(QFile::exists(target.filePath("migration-manifest.json")) == false);
+        CHECK(QFile::exists(target.filePath("foreign.txt")));
+        // The Throne source is untouched by rollback as well.
+        CHECK(hashFile(source.filePath("cache.db")) == cacheHashBefore);
+        return failures;
+    }
+
 }
 
 int main(int argc, char* argv[]) {
@@ -240,6 +316,7 @@ int main(int argc, char* argv[]) {
     failures += testRollback(QDir(source.path()));
     failures += testStaleStagingRemoved(QDir(source.path()));
     failures += testMigrateLiveWalDatabase();
+    failures += testMigrateNonSqliteDbCopiedOpaque();
     failures += testCoexistence();
 
     if (failures == 0) {

@@ -9,6 +9,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QStandardPaths>
+#include <cstring>
+#include <stdexcept>
 #include <utility>
 
 #include <3rdparty/SQLiteCpp/include/SQLiteCpp.h>
@@ -40,14 +42,34 @@ namespace ProxyCore::Storage {
         bool snapshotSqliteIntoStaging(const QDir& source, const QDir& staging,
                                        const QString& rel, QString* error);
 
+        // PC-010-D2: not every *.db in a real Throne data dir is SQLite.
+        // sing-box's cache_file (cache.db) is bbolt, so treating every *.db
+        // as SQLite fails the whole migration with
+        // "cannot snapshot cache.db: file is not a database".
+        // Gate: SQLite magic ("SQLite format 3\0", first 16 bytes). Anything
+        // else is carried opaquely like any other file — downstream requires
+        // nothing special from the cache.
+        bool isSQLiteFile(const QString& absPath) {
+            QFile f(absPath);
+            if (!f.open(QIODevice::ReadOnly)) return false;
+            static const char kMagic[16] = {'S', 'Q', 'L', 'i', 't', 'e', ' ',
+                                            'f', 'o', 'r', 'm', 'a', 't', ' ', '3', '\0'};
+            const QByteArray header = f.read(16);
+            if (header.size() < 16) return false;
+            return std::memcmp(header.constData(), kMagic, 16) == 0;
+        }
+
         // Copies sourceDir -> stagingDir, returning relative paths of staged
         // files. Never writes inside sourceDir.
         //
         // SQLite databases are not plain-copied: a running Throne keeps them
         // in WAL mode, so a byte copy can be torn and committed state can live
-        // in the WAL. Each *.db is read through SQLite's Online Backup API and produces a
-        // consistent Online Backup snapshot — the same WAL-safe pattern as
-        // Database::backupSelective (src/database/Database.cpp).
+        // in the WAL. Each *.db that really is SQLite is read through SQLite's
+        // Online Backup API and produces a consistent snapshot — the same
+        // WAL-safe pattern as Database::backupSelective
+        // (src/database/Database.cpp). Files ending in .db that are NOT
+        // SQLite (bbolt cache.db) are copied opaquely with a manifest entry
+        // instead of failing the run (PC-010-D2).
         bool copyIntoStaging(const QDir& source, const QDir& staging, QStringList* relPaths, QString* error) {
             QDirIterator it(source.absolutePath(),
                             QDir::Files | QDir::Hidden | QDir::NoDotAndDotDot,
@@ -59,7 +81,8 @@ namespace ProxyCore::Storage {
                     *error = QObject::tr("unexpected path outside source: %1").arg(abs);
                     return false;
                 }
-                if (rel.endsWith(".db-wal", Qt::CaseInsensitive) || rel.endsWith(".db-shm", Qt::CaseInsensitive)) {
+                if (rel.endsWith(".db-wal", Qt::CaseInsensitive) || rel.endsWith(".db-shm", Qt::CaseInsensitive) ||
+                    rel.endsWith(".db-journal", Qt::CaseInsensitive)) {
                     // Sidecars are consumed by the snapshot of their own
                     // database, never shipped as files of their own.
                     continue;
@@ -70,7 +93,15 @@ namespace ProxyCore::Storage {
                     return false;
                 }
                 if (rel.endsWith(".db", Qt::CaseInsensitive)) {
-                    if (!snapshotSqliteIntoStaging(source, staging, rel, error)) {
+                    if (!isSQLiteFile(abs)) {
+                        // Opaque payload with a .db suffix (bbolt cache.db):
+                        // carry byte-identical, list in the manifest, do not
+                        // touch SQLite at all.
+                        if (!QFile::copy(abs, dest)) {
+                            *error = QObject::tr("cannot copy %1").arg(rel);
+                            return false;
+                        }
+                    } else if (!snapshotSqliteIntoStaging(source, staging, rel, error)) {
                         return false;
                     }
                 } else if (!QFile::copy(abs, dest)) {
@@ -83,21 +114,84 @@ namespace ProxyCore::Storage {
         }
 
         // Reads the live source database through SQLite and writes a consistent
-        // Online Backup snapshot into staging. SQLite coordinates the snapshot
-        // with an active WAL writer; copying the database and sidecars as
-        // independent files would have a race between those copies.
+        // snapshot into staging. Two paths, both read-only on the source:
+        //
+        // 1. Fast path: Online Backup straight from the source opened
+        //    READONLY. SQLite coordinates the snapshot with an active WAL
+        //    writer, so there is no race between separate db/wal copies.
+        // 2. Recovery fallback: a crash-closed (checkpointed, -shm-less) WAL
+        //    database cannot be opened read-only — recovery needs write
+        //    access, which the source must never get. The db + sidecars are
+        //    copied to "<rel>.raw" inside staging, opened READWRITE there so
+        //    SQLite replays the WAL in OUR copy, then backed up to the final
+        //    staging name. Raw artifacts are always removed. This path runs
+        //    only when no writer is active (the fast path already handles a
+        //    live writer), so the separate file copies have no race.
         bool snapshotSqliteIntoStaging(const QDir& source, const QDir& staging, const QString& rel, QString* error) {
-            bool ok = false;
             try {
                 SQLite::Database live(source.absoluteFilePath(rel).toStdString(), SQLite::OPEN_READONLY);
                 SQLite::Database snapshot(staging.absoluteFilePath(rel).toStdString(),
                                           SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE);
                 SQLite::Backup backup(snapshot, live);
                 backup.executeStep(-1);
+                return true;
+            } catch (const std::exception&) {
+                // Fall through to the staging-recovery path below. The
+                // partial destination (if any) must go: the retry recreates
+                // it from scratch.
+                QFile::remove(staging.absoluteFilePath(rel));
+            }
+
+            const QString rawPath = staging.absoluteFilePath(rel + ".raw");
+            QFile::remove(rawPath);
+            QFile::remove(rawPath + "-wal");
+            QFile::remove(rawPath + "-shm");
+            QFile::remove(rawPath + "-journal");
+            if (!QFile::copy(source.absoluteFilePath(rel), rawPath)) {
+                *error = QObject::tr("cannot snapshot %1: cannot stage database copy").arg(rel);
+                return false;
+            }
+            for (const auto suffix : {"-wal", "-shm", "-journal"}) {
+                const QString sidecar = rel + suffix;
+                if (QFileInfo::exists(source.absoluteFilePath(sidecar)) &&
+                    !QFile::copy(source.absoluteFilePath(sidecar), rawPath + suffix)) {
+                    *error = QObject::tr("cannot snapshot %1: cannot stage %2").arg(rel, sidecar);
+                    QFile::remove(rawPath);
+                    QFile::remove(rawPath + "-wal");
+                    QFile::remove(rawPath + "-shm");
+                    QFile::remove(rawPath + "-journal");
+                    return false;
+                }
+            }
+
+            bool ok = false;
+            try {
+                // Opening the staging copy read-write replays a crash-closed
+                // WAL there; the source database itself is never opened for
+                // writing.
+                SQLite::Database raw(rawPath.toStdString(), SQLite::OPEN_READWRITE);
+                // Handoff gate: the staging copy must pass a read check
+                // before it becomes the migrated snapshot.
+                {
+                    SQLite::Statement check(raw, "PRAGMA quick_check");
+                    while (check.executeStep()) {
+                        if (check.getColumn(0).getString() != "ok")
+                            throw std::runtime_error("quick_check failed: " + check.getColumn(0).getString());
+                    }
+                }
+                SQLite::Database snapshot(staging.absoluteFilePath(rel).toStdString(),
+                                          SQLite::OPEN_READWRITE | SQLite::OPEN_CREATE);
+                SQLite::Backup backup(snapshot, raw);
+                backup.executeStep(-1);
                 ok = true;
             } catch (const std::exception& e) {
+                QFile::remove(staging.absoluteFilePath(rel));
                 *error = QObject::tr("cannot snapshot %1: %2").arg(rel, QString::fromUtf8(e.what()));
             }
+            QFile::remove(rawPath);
+            QFile::remove(rawPath + "-wal");
+            QFile::remove(rawPath + "-shm");
+            QFile::remove(rawPath + "-journal");
             return ok;
         }
     }
