@@ -45,10 +45,10 @@ sha256 `a3961cfe9db0d30fd404d7bd63f18db736f2075afedde27cb522b79f2cc24df9`.
 
 | ID | Приоритет | Суть | Где | Статус |
 |---|---|---|---|---|
-| R1 | P1 | Незакрытый `)` в SDDL ACE в конкатенации `THRONE_SERVICE_SDDL` | `script/windows_installer.iss`, `SetupServiceEnv` | `static checked` на `agent/rec01-installer-static`: одно-символьный фикс перенесён из `010f5f50` + portable regression зелёный; Inno build/SDDL parse/read-back в VM НЕ выполнены → VM-часть остаётся в REC-01 |
+| R1 | P1 | Незакрытый `)` в SDDL ACE в конкатенации `THRONE_SERVICE_SDDL` | `script/windows_installer.iss`, `SetupServiceEnv` | **VM verified** (2026-09-16/17): portable regression зелёный; in-guest парс (RawSecurityDescriptor/ConvertFrom-SddlString) PASS; read-back реестра содержит полную SDDL. Логи: `vm-evidence/recovery/rec01/` |
 | R2 | P1 | `Stop` не ограничен 2-секундным deadline: синхронный Stop до select; Start держит `lifecycleMu` в `boxmain.Create` | `core/server/service_windows.go`, `core/server/server.go` | Открыт → REC-02 |
 | R3 | P1 | Повторный `Start` отложенным cleanup стирает ссылку на работающий runtime (`setBoxInstance(nil,nil)`, сброс mark) | `core/server/server.go` | Открыт → REC-02 |
-| R4 | P1 | Installer не проверяет безопасность цели: `sc`/`icacls` без checked exit codes, repair без ownership-проверки, нет отдельных кавычек вокруг exe в ImagePath, нет reparse-отказа/read-back DACL | `script/windows_installer.iss` | Открыт → REC-01 |
+| R4 | P1 | Installer не проверяет безопасность цели: `sc`/`icacls` без checked exit codes, repair без ownership-проверки, нет отдельных кавычек вокруг exe в ImagePath, нет reparse-отказа/read-back DACL | `script/windows_installer.iss` | **Implemented + VM verified** (07685be8/cdd40710, Setup `ba03f60f…`): quoted ImagePath, ownership guard в PrepareToInstall (foreign — EAbort до изменений), read-back Environment/DACL, reparse-отказ. NOT RUN в VM: reparse-кейс. Silent exit codes недостоверны (см. REC-01.md §6) |
 | R5 | P1 (план) | PC-130 требует UI→service RPC, которых нет: UI поднимает child-core + legacy frame, несовместимый с envelope | `src/sys/Process.cpp`, `src/main.cpp`, `src/api/RPC.cpp` | Открыт → REC-03 (узкий service transport до PC-130) |
 
 ## 4. Какие PASS только исторические (VM PC100-Evidence УДАЛЕНА)
@@ -127,7 +127,13 @@ PC-120 (status.md, последняя запись). Всё ниже — утв�
   объяснение требует либо дополнительного host-side restore между 21:39 и
   22:19 (прямых следов в захваченных журналах нет), либо иного механизма;
   причина не установлена. Просьба владельцу: установить источник вмешательств
-  и остановить их на время сетевых матриц.
+  и остановить их на время сетевых матриц. Дополнительное подтверждение
+  (23:11–23:32 +03, boot#4): отсутствуют recagent v2 (создан 21:36–21:38,
+  проба PASS 21:38; консоль-скриншот `rec01/console/r09-recagent-check.png`),
+  RecVBoxSvc и тулчейн `C:\rec00\go` (`rec01/logs/20260916T202335Z-go-version.log`)
+  — то есть всё, что было создано ПОСЛЕ restore 20:51; это усиливает гипотезу
+  о повторном host-side restore между 21:39 и 22:19 (см. DIAG §6); инициатор
+  по-прежнему UNKNOWN.
 - **Каналы управления:** guestcontrol — рабочий при запущенном VBoxService
   (учетка `recagent`, пароль в guest property `REC00B_CRED`, хранится на
   хосте в .vbox и переживает reboot); интерактивная консоль + offline OCR —
@@ -180,7 +186,15 @@ VBoxService` в госте (консоль) — после этого полны
   зелёный. Inno build + SDDL parse/read-back в госте — по-прежнему
   требуются (REC-01 не завершён). Installer-hardening (R4) — draft в
   `docs/recovery/REC-01.md`.
-- Далее: REC-01 VM-часть (после стабилизации стенда, §6.2), затем REC-02.
+- **REC-01 VM-часть — ВЫПОЛНЕНА (ночь 2026-09-16/17)**: ветка rebased на итог
+  REC-00 (`a854a45f`), добавлены 28950f23 (silent override), 07685be8
+  (hardening R4; итог `cdd40710`). Setup `ba03f60f…` собран в госте (ISCC
+  6.7.3), verified: admin silent install, quoted ImagePath, Environment
+  read-back, service RUNNING, pipe allow(evidence)/deny(recagent/recdeny),
+  foreign-service EAbort до изменений, repair-кейс, fail-closed на sc-ошибке
+  и DACL mismatch. NOT RUN: reparse-кейс. Матрица и находки: `REC-01.md` §5–6;
+  артефакты `vm-evidence/recovery/rec01/`.
+- Далее: REC-02.
 - Правило веток: следующую задачу ветвить от фактического проверенного
   результата предыдущей.
 
