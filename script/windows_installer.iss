@@ -80,10 +80,18 @@ Root: HKA; Subkey: "Software\ProxyCore"; ValueType: string; ValueName: "InstallP
 ; BEFORE the data folder exists (silent no-op, exit code ignored) and leave
 ; it unhardened. AfterInstall chains create -> env+mkdir -> icacls
 ; deterministically. (Call-site deviation from handoff step 1.2, see ADR.)
-Filename: "{sys}\sc.exe"; Parameters: "create ProxyCoreService binPath= ""{app}\ThroneCore.exe service"" start= demand"; Flags: runhidden; Check: IsAdminInstallMode; AfterInstall: SetupServiceEnv
+; REC-01 (R4): ImagePath now carries dedicated quotes around the executable
+; and the whole binPath value is one quoted group, so paths with spaces
+; resolve to our exe and a planted "C:\Program.exe" can never win SCM's
+; unquoted-path resolution. Built in Pascal (ScCreateParams) because the .iss
+; string syntax has no backslash escape for quotes. The foreign-service guard
+; runs in PrepareToInstall, before anything is modified.
+Filename: "{sys}\sc.exe"; Parameters: "{code:ScCreateParams}"; Flags: runhidden; Check: IsAdminInstallMode; AfterInstall: SetupServiceEnv
 ; PC-120: the service data folder must be SYSTEM+Administrators only, so
 ; inheritance from ProgramData is removed.
-Filename: "{sys}\icacls.exe"; Parameters: """{commonappdata}\ProxyCore"" /inheritance:r /grant:r SYSTEM:(OI)(CI)F /grant:r *S-1-5-32-544:(OI)(CI)F"; Flags: runhidden; Check: IsAdminInstallMode
+; REC-01 (R4): AfterInstall VerifyDataDirAcl reads the DACL back and fails
+; closed unless it is exactly inheritance-disabled SYSTEM+Administrators.
+Filename: "{sys}\icacls.exe"; Parameters: """{commonappdata}\ProxyCore"" /inheritance:r /grant:r SYSTEM:(OI)(CI)F /grant:r *S-1-5-32-544:(OI)(CI)F"; Flags: runhidden; Check: IsAdminInstallMode; AfterInstall: VerifyDataDirAcl
 Filename: "{app}\Throne.exe"; Description: "{cm:LaunchProgram,ProxyCore}"; Flags: postinstall nowait skipifsilent
 
 [Code]
@@ -97,6 +105,131 @@ var
   // anchored below it lands off-page (the exact "caption set but invisible"
   // symptom of both previous attempts).
   ServiceNoticeLabel: TNewStaticText;
+
+// ---------------------------------------------------------------------------
+// REC-01 (R4) hardening helpers. Every privileged mutation is followed by a
+// read-back postcondition; any mismatch rolls the service back and aborts
+// Setup (fail closed), so a failed run never leaves a half-installed service.
+// ---------------------------------------------------------------------------
+const
+  ServiceName = 'ProxyCoreService';
+  INVALID_FILE_ATTRIBUTES = $FFFFFFFF;
+
+function GetFileAttributes(lpFileName: String): Cardinal;
+external 'GetFileAttributesW@kernel32.dll stdcall';
+
+function IsReparsePoint(const Dir: String): Boolean;
+var
+  Attr: Cardinal;
+begin
+  // FILE_ATTRIBUTE_REPARSE_POINT / INVALID_FILE_ATTRIBUTES are Inno built-ins.
+  Attr := GetFileAttributes(Dir);
+  Result := (Attr <> INVALID_FILE_ATTRIBUTES) and
+    ((Attr and FILE_ATTRIBUTE_REPARSE_POINT) <> 0);
+end;
+
+procedure RollbackService;
+var
+  Code: Integer;
+begin
+  // Best effort: 1060 (not installed) is fine here.
+  Exec(ExpandConstant('{sys}\sc.exe'), 'delete ' + ServiceName, '',
+    SW_HIDE, ewWaitUntilTerminated, Code);
+  Log('RollbackService: sc delete exit ' + IntToStr(Code));
+end;
+
+// R4: sc arguments for create. binPath= takes ONE quoted group whose inner
+// \" quotes mark the executable, so the registry ImagePath becomes
+// "<app>\ThroneCore.exe" service — correctly quoted for SCM paths with
+// spaces and immune to unquoted-path binary planting.
+function ScCreateParams(Param: String): String;
+begin
+  Result := 'create ' + ServiceName + ' binPath= "\"' +
+    ExpandConstant('{app}\ThroneCore.exe') + '\" service" start= demand';
+end;
+
+procedure FailStep(const What, Detail: String);
+begin
+  Log(What + ' FAILED: ' + Detail);
+  SuppressibleMsgBox(What + ' failed: ' + Detail + #13#10#13#10 +
+    'Setup rolls back the service it created and aborts.',
+    mbError, MB_OK, IDOK);
+  RollbackService;
+  RaiseException(What + ' failed: ' + Detail);
+end;
+
+// Reads the ImagePath of an existing <ServiceName> service. Results:
+// 0 = ImagePath read, 1 = service absent, 2 = query failed.
+function TryReadServiceImagePath(var ImagePath: String): Integer;
+var
+  TmpFile, PsParams: String;
+  Raw: AnsiString;
+  Code: Integer;
+begin
+  TmpFile := ExpandConstant('{tmp}\svcimagepath.txt');
+  DeleteFile(TmpFile);
+  PsParams := '-NoProfile -Command "$ErrorActionPreference = ''Stop''; ' +
+    'try { (Get-ItemProperty -Path ''HKLM:\SYSTEM\CurrentControlSet\Services\' +
+    ServiceName + ''' -Name ImagePath).ImagePath | Out-File -FilePath ''' +
+    TmpFile + ''' -Encoding ascii; exit 0 } catch { exit 1 }"';
+  if not Exec('powershell.exe', PsParams, '', SW_HIDE, ewWaitUntilTerminated, Code) then
+  begin
+    Result := 2;
+    Exit;
+  end;
+  if Code <> 0 then
+  begin
+    Result := 1; // service key absent
+    Exit;
+  end;
+  if not LoadStringFromFile(TmpFile, Raw) then
+  begin
+    Result := 2;
+    Exit;
+  end;
+  ImagePath := Raw;
+  // Out-File writes a trailing CRLF; strip trailing whitespace.
+  while (Length(ImagePath) > 0) and
+      ((ImagePath[Length(ImagePath)] = #13) or
+       (ImagePath[Length(ImagePath)] = #10) or
+       (ImagePath[Length(ImagePath)] = ' ')) do
+    ImagePath := Copy(ImagePath, 1, Length(ImagePath) - 1);
+  Result := 0;
+end;
+
+// R4: a same-named service that is not ours is never modified. Checked in
+// PrepareToInstall (below) so a foreign collision aborts Setup before ANY
+// change - files, service, Environment, ACL - are made. (A RaiseException in
+// a BeforeInstall function does NOT abort Setup: on the stand the [Run] entry
+// still executed and overwrote the foreign service's Environment.)
+function ForeignServiceCollision: String;
+var
+  ImagePath, OurPath: String;
+  Res: Integer;
+begin
+  Result := '';
+  Res := TryReadServiceImagePath(ImagePath);
+  if Res = 2 then
+    Result := 'could not query the state of the ' + ServiceName + ' service';
+  if Res = 0 then
+  begin
+    OurPath := '"' + ExpandConstant('{app}\ThroneCore.exe') + '" service';
+    if CompareText(Trim(ImagePath), OurPath) <> 0 then
+      Result := 'a service named "' + ServiceName + '" already exists but points to: ' +
+        Trim(ImagePath);
+  end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  if IsAdminInstallMode then
+  begin
+    Result := ForeignServiceCollision;
+    if Result <> '' then
+      Log('PrepareToInstall: refusing to continue - ' + Result);
+  end;
+end;
 
 // No legacy Throne lookup here: ProxyCore must never install into (or
 // upgrade over) a Throne installation.
@@ -150,6 +283,10 @@ var
   SidRaw: AnsiString;
   ResultCode: Integer;
 begin
+  DataDir := ExpandConstant('{commonappdata}\ProxyCore');
+  // R4: refuse reparse-point targets before anything is mutated.
+  if IsReparsePoint(ExpandConstant('{app}')) or IsReparsePoint(DataDir) then
+    FailStep('SetupServiceEnv', 'install or data folder is a reparse point');
   User := GetUserNameString;
   TmpFile := ExpandConstant('{tmp}\ownersid.txt');
   // Windows PowerShell 5.1 exits 0 even after non-terminating errors, so
@@ -158,36 +295,40 @@ begin
   PsParams := '-NoProfile -Command "$ErrorActionPreference = ''Stop''; (Get-LocalUser -Name ''' + User +
     ''').Sid.Value | Out-File -FilePath ''' + TmpFile + ''' -Encoding ascii"';
   if not Exec('powershell.exe', PsParams, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
-  begin
-    SuppressibleMsgBox('Could not determine the SID of the installing user (PowerShell exit code ' + IntToStr(ResultCode) + ').', mbError, MB_OK, IDOK);
-    RaiseException('SetupServiceEnv: SID lookup failed');
-  end;
+    FailStep('SetupServiceEnv', 'could not determine the SID of the installing user (PowerShell exit code ' + IntToStr(ResultCode) + ')');
   if not LoadStringFromFile(TmpFile, SidRaw) then
-  begin
-    SuppressibleMsgBox('Could not read the installing user''s SID from the temporary file.', mbError, MB_OK, IDOK);
-    RaiseException('SetupServiceEnv: SID file read failed');
-  end;
+    FailStep('SetupServiceEnv', 'could not read the installing user''s SID from the temporary file');
   Sid := Trim(SidRaw);
   if Sid = '' then
-  begin
-    SuppressibleMsgBox('Could not determine the SID of the installing user "' + User + '".', mbError, MB_OK, IDOK);
-    RaiseException('SetupServiceEnv: empty SID');
-  end;
-  DataDir := ExpandConstant('{commonappdata}\ProxyCore');
+    FailStep('SetupServiceEnv', 'could not determine the SID of the installing user "' + User + '"');
   // Same command shape as the VM evidence round 2: REG_MULTI_SZ under the
   // service's Environment key, applied by stopping/starting the service —
   // here the service simply starts on demand later.
-  PsParams := '-NoProfile -Command "$ErrorActionPreference = ''Stop''; Set-ItemProperty -Path ''HKLM:\SYSTEM\CurrentControlSet\Services\ProxyCoreService'' -Name Environment -Type MultiString -Value @(''THRONE_SERVICE_SDDL=D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;' + Sid + ')'',''THRONE_SERVICE_ALLOWED_SIDS=' + Sid + ''',''THRONE_SERVICE_DATA_DIR=' + DataDir + ''')"';
+  PsParams := '-NoProfile -Command "$ErrorActionPreference = ''Stop''; Set-ItemProperty -Path ''HKLM:\SYSTEM\CurrentControlSet\Services\' + ServiceName + ''' -Name Environment -Type MultiString -Value @(''THRONE_SERVICE_SDDL=D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;' + Sid + ')'',''THRONE_SERVICE_ALLOWED_SIDS=' + Sid + ''',''THRONE_SERVICE_DATA_DIR=' + DataDir + ''')"';
   if not Exec('powershell.exe', PsParams, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
-  begin
-    SuppressibleMsgBox('Could not write the ProxyCoreService environment (PowerShell exit code ' + IntToStr(ResultCode) + ').', mbError, MB_OK, IDOK);
-    RaiseException('SetupServiceEnv: Environment write failed');
-  end;
+    FailStep('SetupServiceEnv', 'could not write the ProxyCoreService environment (PowerShell exit code ' + IntToStr(ResultCode) + ')');
+  // R4: read the Environment back and compare every value byte-for-byte.
+  PsParams := '-NoProfile -Command "$ErrorActionPreference = ''Stop''; $v = (Get-ItemProperty -Path ''HKLM:\SYSTEM\CurrentControlSet\Services\' + ServiceName + ''').Environment; if (($v.Count -eq 3) -and ($v[0] -eq ''THRONE_SERVICE_SDDL=D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;' + Sid + ')'') -and ($v[1] -eq ''THRONE_SERVICE_ALLOWED_SIDS=' + Sid + ''') -and ($v[2] -eq ''THRONE_SERVICE_DATA_DIR=' + DataDir + ''')) { exit 0 } else { exit 1 }"';
+  if not Exec('powershell.exe', PsParams, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+    FailStep('SetupServiceEnv', 'service Environment read-back does not match the expected values (PowerShell exit code ' + IntToStr(ResultCode) + ')');
   if not ForceDirectories(DataDir) then
-  begin
-    SuppressibleMsgBox('Could not create the service data folder "' + DataDir + '".', mbError, MB_OK, IDOK);
-    RaiseException('SetupServiceEnv: data folder creation failed');
-  end;
+    FailStep('SetupServiceEnv', 'could not create the service data folder "' + DataDir + '"');
+  Log('SetupServiceEnv: service Environment verified against expected values');
+end;
+
+// R4: read the data folder DACL back and fail closed unless it is exactly
+// inheritance-disabled SYSTEM+Administrators (the icacls [Run] entry above).
+procedure VerifyDataDirAcl;
+var
+  PsParams: String;
+  ResultCode: Integer;
+begin
+  PsParams := '-NoProfile -Command "$ErrorActionPreference = ''Stop''; $s = (Get-Acl -Path ''' +
+    ExpandConstant('{commonappdata}\ProxyCore') +
+    ''').Sddl; if ($s -match ''D:P[A-Z]*\(A;OICI;FA;;;SY\)\(A;OICI;FA;;;BA\)$'') { exit 0 } else { Write-Output $s; exit 1 }"';
+  if not Exec('powershell.exe', PsParams, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+    FailStep('VerifyDataDirAcl', 'service data folder DACL read-back is not SYSTEM+Administrators-only (PowerShell exit code ' + IntToStr(ResultCode) + ')');
+  Log('VerifyDataDirAcl: DACL verified as inheritance-disabled SYSTEM+Administrators');
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -265,18 +406,31 @@ end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
-  App: String;
-  ResultCode: Integer;
+  App, ImagePath, OurPath: String;
+  Res, ResultCode: Integer;
 begin
   App := ExpandConstant('{app}');
   if CurUninstallStep = usUninstall then
   begin
-    // PC-120: stop and delete the service before killing leftover processes.
-    // Results are ignored — the service may not exist (non-admin install).
-    // The service's Environment key is removed by Windows together with the
-    // service itself, it is never touched separately.
-    Exec(ExpandConstant('{sys}\sc.exe'), 'stop ProxyCoreService', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-    Exec(ExpandConstant('{sys}\sc.exe'), 'delete ProxyCoreService', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // REC-01 (R4): stop and delete the service only when it is ours. A
+    // same-named foreign service is logged and left untouched; when no
+    // service exists the steps are skipped. The service's Environment key
+    // is removed by Windows together with the service itself, it is never
+    // touched separately.
+    Res := TryReadServiceImagePath(ImagePath);
+    if Res = 0 then
+    begin
+      OurPath := '"' + App + '\ThroneCore.exe" service';
+      if CompareText(Trim(ImagePath), OurPath) = 0 then
+      begin
+        Exec(ExpandConstant('{sys}\sc.exe'), 'stop ' + ServiceName, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+        Exec(ExpandConstant('{sys}\sc.exe'), 'delete ' + ServiceName, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      end
+      else
+        Log('Uninstall: service ' + ServiceName + ' belongs to "' + Trim(ImagePath) + '", left untouched');
+    end
+    else
+      Log('Uninstall: no ' + ServiceName + ' service present');
     StopThrone;
     DeleteUserData := SuppressibleMsgBox('Also delete your ProxyCore profiles, settings and logs, including the service data folder?' + #13#10#13#10 +
       'Choose No if you plan to reinstall ProxyCore later and want to keep them.', mbConfirmation, MB_YESNO, IDYES) = IDYES;
