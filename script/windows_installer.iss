@@ -172,7 +172,7 @@ begin
   // Same command shape as the VM evidence round 2: REG_MULTI_SZ under the
   // service's Environment key, applied by stopping/starting the service —
   // here the service simply starts on demand later.
-  PsParams := '-NoProfile -Command "$ErrorActionPreference = ''Stop''; Set-ItemProperty -Path ''HKLM:\SYSTEM\CurrentControlSet\Services\ProxyCoreService'' -Name Environment -Type MultiString -Value @(''THRONE_SERVICE_SDDL=D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;' + Sid + ''',''THRONE_SERVICE_ALLOWED_SIDS=' + Sid + ''',''THRONE_SERVICE_DATA_DIR=' + DataDir + ''')"';
+  PsParams := '-NoProfile -Command "$ErrorActionPreference = ''Stop''; Set-ItemProperty -Path ''HKLM:\SYSTEM\CurrentControlSet\Services\ProxyCoreService'' -Name Environment -Type MultiString -Value @(''THRONE_SERVICE_SDDL=D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;' + Sid + ')'',''THRONE_SERVICE_ALLOWED_SIDS=' + Sid + ''',''THRONE_SERVICE_DATA_DIR=' + DataDir + ''')"';
   if not Exec('powershell.exe', PsParams, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
   begin
     SuppressibleMsgBox('Could not write the ProxyCoreService environment (PowerShell exit code ' + IntToStr(ResultCode) + ').', mbError, MB_OK, IDOK);
@@ -290,3 +290,4 @@ begin
     RemoveDir(App);
   end;
 end;
+
