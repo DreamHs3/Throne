@@ -45,7 +45,7 @@ sha256 `a3961cfe9db0d30fd404d7bd63f18db736f2075afedde27cb522b79f2cc24df9`.
 
 | ID | Приоритет | Суть | Где | Статус |
 |---|---|---|---|---|
-| R1 | P1 | Незакрытый `)` в SDDL ACE в конкатенации `THRONE_SERVICE_SDDL` | `script/windows_installer.iss`, `SetupServiceEnv` | Закрывающая скобка возвращена recovery-патчем ветки `codex/recovery-review` + portable regression; Inno build/SDDL parse/read-back в VM НЕ выполнены → закрывает REC-01 |
+| R1 | P1 | Незакрытый `)` в SDDL ACE в конкатенации `THRONE_SERVICE_SDDL` | `script/windows_installer.iss`, `SetupServiceEnv` | `static checked` на `agent/rec01-installer-static`: одно-символьный фикс перенесён из `010f5f50` + portable regression зелёный; Inno build/SDDL parse/read-back в VM НЕ выполнены → VM-часть остаётся в REC-01 |
 | R2 | P1 | `Stop` не ограничен 2-секундным deadline: синхронный Stop до select; Start держит `lifecycleMu` в `boxmain.Create` | `core/server/service_windows.go`, `core/server/server.go` | Открыт → REC-02 |
 | R3 | P1 | Повторный `Start` отложенным cleanup стирает ссылку на работающий runtime (`setBoxInstance(nil,nil)`, сброс mark) | `core/server/server.go` | Открыт → REC-02 |
 | R4 | P1 | Installer не проверяет безопасность цели: `sc`/`icacls` без checked exit codes, repair без ownership-проверки, нет отдельных кавычек вокруг exe в ImagePath, нет reparse-отказа/read-back DACL | `script/windows_installer.iss` | Открыт → REC-01 |
@@ -86,24 +86,53 @@ PC-120 (status.md, последняя запись). Всё ниже — утв�
 | Параметр | Значение |
 |---|---|
 | VM | `PC130-Evidence`, UUID `2a5bd38d-46bd-47a8-8e83-c1fe1aa2138b`, E:\VMs |
-| Состояние | RUNNING с 2026-09-16 17:44:55 (+03); desktop, вход выполнен пользователем `evidence` (admin) — скриншот `vm-evidence/recovery/rec00-vm-state2.png` |
-| Гость | Windows 11 Pro 25H2, build 10.0.26200.8037, en-US, EFI, 4 vCPU, 8192 MB, VDI 120 GB dynamic |
-| Guest Additions | 7.2.16 r174877, RunLevel 3 |
-| ISO (легальный, официальный MS) | `E:\Win11_25H2_English_x64.iso`, 8 471 603 200 B, sha256 `768984706b909479417b2368438909440f2967ff05c6a9195ed2667254e465e3` (пересчитан 2026-09-16, совпал с 01-VM-PROVISION.txt) |
-| Snapshot | `REC00-CLEAN-BASE-OS` UUID `525f8012-18d5-4c69-9414-8f5838255c3f` (2026-09-16, live): чистая ОС, БЕЗ тулчейна/служб/TUN/firewall — НЕ удалять до конца PC-140 |
+| Состояние | RUNNING (boot #4, 2026-09-16 21:43 +03), Win11 Pro 25H2 build 10.0.26200.8037, EFI, 4 vCPU, 8192 MB, VDI 120 GB dynamic |
+| Snapshot'ы | `REC00-CLEAN-BASE-OS` `525f8012-…`; `REC00B-TOOLCHAIN-READY` `a071da87-…` (содержит ПОЛНУЮ сессию #1: recagent v1, тулчейн, BUILD_OK); `REC00B-TOOLCHAIN-READY-V2` `31ef4968-…` (актуальный: тулчейн + recagent v2 + RecVBoxSvc-механика) — НЕ удалять до конца PC-140 |
+| Guest Additions | 7.2.16 r174877 (VBoxService в госте — см. блокер ниже) |
+| ISO (легальный, официальный MS) | `E:\Win11_25H2_English_x64.iso`, 8 471 603 200 B, sha256 `768984706b90…65e3` (пересчитан 2026-09-16, совпал) |
 | Диски | D: свободно ~103 ГБ; E: свободно ~240 ГБ |
-| Часы | `rtcuseutc=off` (гость в локальном времени; UTC фиксировать командой в госте — пока BLOCKED) |
 
-**BLOCKED (единственный отсутствующий prerequisite стендовой части):**
-`VBoxManage guestcontrol` завершается `VBOX_E_IPRT_ERROR: The guest execution
-service is not ready (yet)` — 2 попытки с паузой 30 с, 2026-09-16 ~19:5x–20:0x.
-Следствие: guest execution, передача файлов, controlled elevation, снятие
-stdout/stderr/exit code, compile smoke в госте — NOT RUN. Для разблокировки
-нужно (владелец/интерактивно в консоли VM): проверить/переустановить guest
-control-компонент Guest Additions и передать агенту пароль пользователя
-`evidence` (пароль НЕ архивирован — только чат владельца; агенту не сообщать
-в логах/файлах). Скрипт-оркестратор: `tests/proxycore/windows/recovery/run-vm-smoke.ps1`
-(см. README там же); он сам останавливается с кодом 2 при этой ошибке.
+### 6.1 Итог REC-00B (2026-09-16, вечер)
+
+- **Warm-session полный цикл — PASS** (run7): guest command (stdout/exit) ✓,
+  файл в обе стороны со сверкой SHA-256 ✓, доставка portable Go 1.27.0 +
+  module cache одним архивом (450 MB) ✓, compile smoke на source
+  `facebecf(+gen)` с `BUILD_OK` ✓, артефакт `ThroneCore-rec00b.exe`
+  sha256 `b03bc93cccc8d731858a8f1ec16ed2d6729235c36f8f837d2303c78c48ad555d`
+  — **побайтово идентичен** в двух независимых сборках (run4 = run7).
+- **Cold-start auto-ready — BLOCKED**: после чистого poweroff→start
+  VBoxService не стартует сам (AUTO_START, но STATE STOPPED, exit 1077 — SCM
+  не пытался); гостевой канал недоступен до ручного `net start VBoxService`.
+  Временная задача `RecVBoxSvc` (SYSTEM, onstart, `cmd /c net start
+  VBoxService`) сработала на boot#3, но исчезла после внешних вмешательств
+  (см. 6.2). Это workaround, не фикс; кандидат-фикс — repair/reinstall GA из
+  локального ISO + контролируемая boot-матрица.
+- **6.2 Внешние вмешательства в стенд (важно, вопрос владельцу):** в
+  VBox.log boot#4 зафиксированы два жёстких `RUNNING→RESETTING` в 21:51:51 и
+  21:55:30 (+03), агентом не выполнялись; между 20:50 и 20:52 VM была
+  внешне восстановлена к `REC00-CLEAN-BASE-OS` (доказано цепочкой дисков:
+  активная запись в свежем diff `{fd9a4b10}` с 20:51, `{76551b5e}` заморожен
+  на 20:41). В результате пропадали: recagent v1, `C:\rec00`, RecVBoxSvc.
+  Прошу владельца подтвердить источник (VirtualBox GUI?) и остановить
+  вмешательства на время сетевых матриц.
+- **Каналы управления:** guestcontrol — рабочий при запущенном VBoxService
+  (учетка `recagent`, пароль в guest property `REC00B_CRED`, хранится на
+  хосте в .vbox и переживает reboot); интерактивная консоль + offline OCR —
+  надёжный fallback (использовалась для всей диагностики). Synthetic
+  keyboard: избегать мульти-сканкодовых аккордов одной посылкой; при залипании
+  модификаторов лечится двойным Shift.
+- **Раздельные вердикты REC-00B:** guest execution service ✓ (после ручного
+  старта сервиса); credentials ✓ (recagent v2); controlled elevation в госте ✓
+  (UAC Alt+Y, High integrity подтверждён `whoami /groups` = S-1-16-12288);
+  передача файлов ✓; compile smoke ✓ (warm); холодная авто-готовность ✗
+  BLOCKED.
+- Полное расследование: `D:\GLM_project\vm-evidence\recovery\rec00b\`
+  (`DIAG-guestcontrol-outage.md`, glogs/, console/, run1–run9, transfer/).
+
+**Блокер стенда (один):** автоматический старт VBoxService на холодной
+загрузке. До его устранения каждая холодная сессия требует ручного `net start
+VBoxService` в госте (консоль) — после этого полный цикл воспроизводится
+скриптом без сети (`-Offline`) при живом тулчейне на диске.
 
 ## 7. Инвентарь PC-130 попыток (локально, ничего не удалено)
 
@@ -124,14 +153,32 @@ control-компонент Guest Additions и передать агенту па
 
 ## 8. Текущая задача и порядок
 
-- Выполнено: REC-00 (этот файл + README/скрипт оркестрации + аддендум в pc130;
-  production-код не менялся).
-- Далее: REC-01 (SDDL fix проверка + installer hardening; статическую часть
-  можно делать без VM), затем REC-02 (lifecycle Start/Stop; обязательны
-  Windows runtime тесты). VM-приёмка REC-01/02 — после разблокировки §6.
+- Выполнено: REC-00 (baseline-документы, 2026-09-16 днём) и REC-00B
+  (восстановление управления стендом, вечер): warm-цикл PASS, cold-start
+  auto-ready BLOCKED (см. §6.1), production-код не менялся. REC-00 НЕ
+  закрывается: по определению задачи PASS требует холодной последовательности
+  «cold-start VM → guest command → сборка → выгрузка логов» без ручных
+  вмешательств — сейчас возможна только с ручным `net start VBoxService`.
+- REC-01 (статическая часть, ветка `agent/rec01-installer-static`):
+  подтверждено, что база `93e8970` НЕ содержит recovery-коммит
+  `010f5f50c9f63c8665fa1cf86465aeaf432d2b46` из `codex/recovery-review`;
+  portable regression `tests/proxycore/test_installer_sddl_contract.py`
+  красный на базе (2 SID-кейса), после переноса одно-символьного SDDL-фикса —
+  зелёный. Inno build + SDDL parse/read-back в госте — по-прежнему
+  требуются (REC-01 не завершён). Installer-hardening (R4) — draft в
+  `docs/recovery/REC-01.md`.
+- Далее: REC-01 VM-часть (после стабилизации стенда, §6.2), затем REC-02.
 - Правило веток: следующую задачу ветвить от фактического проверенного
-  результата предыдущей (сейчас: `agent/rec00-current-state` после коммита
-  файлов REC-00).
+  результата предыдущей.
+
+## 8.1 Пометка для REC-01 (owner instruction, 2026-09-16)
+
+База `93e8970` не включает recovery-коммит `010f5f50` (fix + regression + docs
+в `codex/recovery-review`). До переноса в нашу ветку считалось: «SDDL fix не
+применён». Теперь: перенос выполнен статически на
+`agent/rec01-installer-static` (фикс + тест, regression зелёный), но это
+`static checked`, НЕ `VM verified` — Inno build, Windows SDDL parser и
+read-back Environment остаются обязательными шагами REC-01.
 
 ## 9. Классификатор статусов (не смешивать)
 
