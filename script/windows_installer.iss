@@ -35,7 +35,12 @@ UninstallDisplayName=ProxyCore
 UninstallDisplayIcon={app}\Throne.exe
 WizardStyle=modern
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
+; REC-01: commandline override added so silent installs can select admin mode
+; (/ALLUSERS). With only "dialog", a /VERYSILENT run always used the lowest
+; default and silently skipped the service half even from an elevated prompt
+; (observed on the stand 2026-09-16). Interactive behavior is unchanged: the
+; dialog still offers the choice.
+PrivilegesRequiredOverridesAllowed=dialog commandline
 DefaultDirName={code:DefaultInstallDir}
 DirExistsWarning=no
 DisableProgramGroupPage=yes
