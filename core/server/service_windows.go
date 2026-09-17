@@ -661,7 +661,25 @@ func (h *proxyCoreServiceHandler) Execute(args []string, r <-chan svc.ChangeRequ
 				conns.closeAll()
 				beginServiceRuntimeShutdown()
 				// Stop is idempotent by upstream contract (no instance → nil error).
-				_, _ = globalServer.Stop(context.Background(), &gen.EmptyReq{})
+				// REC-02 R2: the runtime stop is bounded AT THIS BOUNDARY.
+				// A start parked inside boxmain.Create holds lifecycleMu for
+				// as long as the creation takes (and Stop itself bounds its
+				// lock wait and its close at 2s each), so the unguarded call
+				// could hold the stop path past any deadline. Correctness
+				// past the deadline comes from the shutdown mark (F7): a
+				// start that finishes later tears its own runtime down and
+				// refuses, so Stopped never leaves a published runtime
+				// behind and is never a false clean-stop.
+				stopDone := make(chan struct{})
+				go func() {
+					_, _ = globalServer.Stop(context.Background(), &gen.EmptyReq{})
+					close(stopDone)
+				}()
+				select {
+				case <-stopDone:
+				case <-time.After(2 * time.Second):
+					log.Println("service stop: the runtime stop did not finish within 2s; the shutdown mark owns the teardown")
+				}
 				select {
 				case <-handlersDone:
 				case <-time.After(2 * time.Second):

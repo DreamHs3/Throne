@@ -37,7 +37,10 @@ import (
 	xinternet "github.com/xtls/xray-core/transport/internet"
 )
 
-// Serializes Start against Stop: the dispatcher gives every request its own goroutine.
+// Serializes Start against Stop: the dispatcher gives every request its own
+// goroutine. Start holds it across boxmain.Create; Stop acquires it through
+// a bounded TryLock loop (REC-02 R2) so a creation that stalls cannot hold
+// the stop path past the service deadline.
 var lifecycleMu sync.Mutex
 
 // Guards the instance pointers; never held across a Create/Start, so pollers do not block behind a profile start.
@@ -340,7 +343,7 @@ func prepareTestEnv(current bool, needXray bool, xrayConfig string, xrayFullConf
 		return nil, err
 	}
 	cleanups = append(cleanups, func() {
-		box.CloseWithTimeout(cancel, 2*time.Second, log.Println, false)
+		box.CloseWithTimeout(cancel, 2*time.Second, log.Println)
 	})
 
 	outTags := tags
@@ -488,7 +491,7 @@ func (s *server) Start(ctx context.Context, in *gen.LoadConfigReq) (out *gen.Err
 
 	if runtime.GOOS == "darwin" && in.GetTunIpv4Cidr() != "" {
 		stopAllCores := func() {
-			box.CloseWithTimeout(cancel, time.Second*2, log.Println, true)
+			box.CloseWithTimeout(cancel, time.Second*2, log.Println)
 			setBoxInstance(nil, nil)
 			if extraProcess != nil {
 				extraProcess.Stop()
@@ -523,7 +526,26 @@ func (s *server) Start(ctx context.Context, in *gen.LoadConfigReq) (out *gen.Err
 }
 
 func (s *server) Stop(ctx context.Context, in *gen.EmptyReq) (out *gen.ErrorResp, _ error) {
-	lifecycleMu.Lock()
+	// REC-02 R2: a Start parked inside boxmain.Create holds the lock for as
+	// long as the creation takes. The stop path gives up after the deadline
+	// instead of blocking forever and reports an error - never a clean stop.
+	// The service stop path pairs this with the F7 shutdown mark, so a Start
+	// that outlives it tears its own runtime down and refuses.
+	// REC-02 R2: bounded acquisition - a Start parked inside boxmain.Create
+	// holds the lock for as long as the creation takes. Give up after the
+	// deadline and report an error - never a clean stop. The service stop
+	// path pairs this with the F7 shutdown mark, so a Start that outlives it
+	// tears its own runtime down and refuses.
+	stopLockDeadline := time.Now().Add(2 * time.Second)
+	for {
+		if lifecycleMu.TryLock() {
+			break
+		}
+		if time.Now().After(stopLockDeadline) {
+			return &gen.ErrorResp{Error: To("stop timed out: an in-flight start still holds the lifecycle lock")}, nil
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	defer lifecycleMu.Unlock()
 
 	var err error
@@ -549,7 +571,7 @@ func (s *server) Stop(ctx context.Context, in *gen.EmptyReq) (out *gen.ErrorResp
 	}
 	// Unpublished first, so a poll mid-teardown sees no instance rather than a dying one.
 	setBoxInstance(nil, nil)
-	box.CloseWithTimeout(cancel, time.Second*2, log.Println, true)
+	box.CloseWithTimeout(cancel, time.Second*2, log.Println)
 
 	if extraProcess != nil {
 		extraProcess.Stop()
