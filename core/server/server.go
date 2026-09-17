@@ -373,6 +373,15 @@ func (s *server) Start(ctx context.Context, in *gen.LoadConfigReq) (out *gen.Err
 	lifecycleMu.Lock()
 	defer lifecycleMu.Unlock()
 
+	// REC-02 R3: this request is refused before it can touch any state, so
+	// the deferred cleanup below must NOT run for it. The running instance
+	// was created by an earlier request: wiping the reference (and the
+	// redirect mark) here would orphan a live runtime - the box keeps
+	// running while the next Stop sees nil and Health lies.
+	if currentBox() != nil {
+		return &gen.ErrorResp{Error: To("instance already started")}, nil
+	}
+
 	var err error
 
 	defer func() {
@@ -389,11 +398,6 @@ func (s *server) Start(ctx context.Context, in *gen.LoadConfigReq) (out *gen.Err
 		if in.XrayConfig != nil {
 			log.Println("Start Xray:", *in.XrayConfig)
 		}
-	}
-
-	if currentBox() != nil {
-		err = errors.New("instance already started")
-		return
 	}
 
 	if *in.NeedExtraProcess {
