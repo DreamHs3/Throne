@@ -159,6 +159,60 @@ class InstallerSddlContract(unittest.TestCase):
         for needle in ("{win}", "{commonpf}", "{commonpf32}"):
             self.assertIn(needle, policy)
 
+    @staticmethod
+    def _pf_suffix_and_first_component(d, pf):
+        """Mirror of the exact Pascal arithmetic in ProtectedDirViolation rule
+        (c): Rest = suffix after '<pf>\\'; first component = up to the first
+        backslash. Regression for the T5 false positive where Copy(Rest, 2, ...)
+        cut the first CHARACTER instead of a leading backslash and rejected
+        the default install dir 'C:\\Program Files\\ProxyCore'."""
+        def add_bs(p):
+            return p if p.endswith("\\") else p + "\\"
+        pf = pf.rstrip("\\")
+        d = d if len(d) <= 3 else d.rstrip("\\")
+        rest = ""
+        under_pf = add_bs(d).upper().startswith(add_bs(pf).upper())
+        if under_pf:
+            rest = add_bs(d)[len(add_bs(pf)):]
+        first = rest
+        pos = first.find("\\")
+        if pos >= 0:
+            first = first[:pos]
+        return under_pf, rest, first
+
+    def test_rec01c_deny_list_pf_component_extraction(self):
+        add_bs = lambda p: p if p.endswith("\\") else p + "\\"
+        pf = "C:\\Program Files"
+        pf32 = "C:\\Program Files (x86)"
+        # default install dir must stay allowed (R2 T5 false positive)
+        under, rest, first = self._pf_suffix_and_first_component(
+            "C:\\Program Files\\ProxyCore", pf)
+        self.assertTrue(under)
+        self.assertEqual(first, "ProxyCore")
+        # deeper nesting inside our own folder stays allowed
+        _, _, first = self._pf_suffix_and_first_component(
+            "C:\\Program Files\\ProxyCore\\sub", pf)
+        self.assertEqual(first, "ProxyCore")
+        # foreign application areas are violations
+        _, _, first = self._pf_suffix_and_first_component(
+            "C:\\Program Files\\SomeOtherApp\\ProxyCore", pf)
+        self.assertNotEqual(first, "ProxyCore")
+        # the (x86) root area is caught by the second prefix
+        under32, rest32, first32 = self._pf_suffix_and_first_component(
+            "C:\\Program Files (x86)\\Foo", pf32)
+        self.assertTrue(under32)
+        self.assertNotEqual(first32, "ProxyCore")
+        # the Program Files root itself yields an empty suffix -> violation
+        under_root, rest_root, _ = self._pf_suffix_and_first_component(
+            "C:\\Program Files", pf)
+        self.assertTrue(under_root)
+        self.assertEqual(rest_root, "")
+        # unrelated paths match neither prefix
+        under_x, _, _ = self._pf_suffix_and_first_component("C:\\Foo", pf)
+        self.assertFalse(under_x)
+        self.assertFalse(
+            add_bs("c:\\foo").upper().startswith(add_bs(pf32).upper()))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -205,7 +205,8 @@ begin
     Exit;
   end;
   // (c) Program Files areas: only our own 'ProxyCore' folder is accepted as
-  // the first component; every other application's area is foreign.
+  // the first component; every other application's area is foreign, and the
+  // Program Files root itself is not a payload target.
   Rest := '';
   Pf := RemoveBackslashUnlessRoot(ExpandConstant('{commonpf}'));
   if Pos(Uppercase(AddBackslash(Pf)), Uppercase(AddBackslash(D))) = 1 then
@@ -218,15 +219,19 @@ begin
   end;
   if Rest <> '' then
   begin
-    // first path component inside the Program Files root
-    P := Copy(Rest, 2, MaxInt);
-    while (Length(P) > 0) and (P[Length(P)] <> '\') do
-      P := Copy(P, 1, Length(P) - 1);
-    if Length(P) > 0 then
-      P := Copy(P, 1, Length(P) - 1);
+    // Rest is the path SUFFIX after '<Program Files>\', e.g. 'ProxyCore',
+    // 'ProxyCore\sub' or 'Common Files\X' (always with a trailing backslash,
+    // never a leading one). The first component is everything before the
+    // FIRST backslash.
+    P := Rest;
+    if Pos('\', P) > 0 then
+      P := Copy(P, 1, Pos('\', P) - 1);
     if CompareText(P, 'ProxyCore') <> 0 then
       Result := 'installing into another application''s Program Files area is not allowed (' + D + ')';
-  end;
+  end
+  else if (Pos(Uppercase(AddBackslash(Pf)), Uppercase(AddBackslash(D))) = 1) or
+          (CompareText(D, Pf) = 0) then
+    Result := 'installing into the Program Files root is not allowed (' + D + ')';
 end;
 
 procedure RollbackService;
