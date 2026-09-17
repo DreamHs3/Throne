@@ -545,23 +545,6 @@ begin
   Log('SetupServiceEnv: service Environment verified against expected values');
 end;
 
-// R4: read the data folder DACL back and fail closed unless it is exactly
-// inheritance-disabled SYSTEM+Administrators (the icacls [Run] entry above).
-procedure VerifyDataDirAcl;
-var
-  PsParams: String;
-  ResultCode: Integer;
-begin
-  PsParams := '-NoProfile -Command "$ErrorActionPreference = ''Stop''; $s = (Get-Acl -Path ''' +
-    ExpandConstant('{commonappdata}\ProxyCore') +
-    ''').Sddl; if ($s -match ''D:P[A-Z]*\(A;OICI;FA;;;SY\)\(A;OICI;FA;;;BA\)$'') { exit 0 } else { Write-Output $s; exit 1 }"';
-  if not Exec('powershell.exe', PsParams, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
-    FailStep('VerifyDataDirAcl', 'service data folder DACL read-back is not SYSTEM+Administrators-only (PowerShell exit code ' + IntToStr(ResultCode) + ')');
-  Log('VerifyDataDirAcl: DACL verified as inheritance-disabled SYSTEM+Administrators');
-  // REC-01C: with the data folder verified, verify the install folder too.
-  VerifyAppDirAcl;
-end;
-
 // REC-01C: the install folder and the service binary must not be modifiable
 // or replaceable by unprivileged principals - neither a writable exe ACE nor
 // folder rights that allow planting/renaming/deleting files next to it
@@ -598,6 +581,24 @@ begin
     FailStep('VerifyAppDirAcl', 'the install folder or its service binary is writable or replaceable by a non-administrative principal (exit code ' + IntToStr(ResultCode) + ')');
   Log('VerifyAppDirAcl: install folder and service binary are not writable by unprivileged principals');
 end;
+
+// R4: read the data folder DACL back and fail closed unless it is exactly
+// inheritance-disabled SYSTEM+Administrators (the icacls [Run] entry above).
+procedure VerifyDataDirAcl;
+var
+  PsParams: String;
+  ResultCode: Integer;
+begin
+  PsParams := '-NoProfile -Command "$ErrorActionPreference = ''Stop''; $s = (Get-Acl -Path ''' +
+    ExpandConstant('{commonappdata}\ProxyCore') +
+    ''').Sddl; if ($s -match ''D:P[A-Z]*\(A;OICI;FA;;;SY\)\(A;OICI;FA;;;BA\)$'') { exit 0 } else { Write-Output $s; exit 1 }"';
+  if not Exec('powershell.exe', PsParams, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+    FailStep('VerifyDataDirAcl', 'service data folder DACL read-back is not SYSTEM+Administrators-only (PowerShell exit code ' + IntToStr(ResultCode) + ')');
+  Log('VerifyDataDirAcl: DACL verified as inheritance-disabled SYSTEM+Administrators');
+  // REC-01C: with the data folder verified, verify the install folder too.
+  VerifyAppDirAcl;
+end;
+
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
