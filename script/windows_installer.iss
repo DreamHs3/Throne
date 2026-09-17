@@ -124,6 +124,11 @@ var
 const
   ServiceName = 'ProxyCoreService';
   INVALID_FILE_ATTRIBUTES = $FFFFFFFF;
+  // REC-01C: sc create without obj= leaves the service on the LocalSystem
+  // account, so that is the ONLY account a same-name service may run under
+  // to count as ours. A service whose ImagePath matches but whose account was
+  // reconfigured is someone else's config and is never modified.
+  ExpectedServiceAccount = 'LocalSystem';
 
 function GetFileAttributes(lpFileName: String): Cardinal;
 external 'GetFileAttributesW@kernel32.dll stdcall';
@@ -279,42 +284,56 @@ begin
   SavedEnvironment := TrimTail(Raw);
 end;
 
-// Reads the ImagePath of an existing <ServiceName> service. Results:
-// 0 = ImagePath read, 1 = service absent, 2 = query failed.
-function TryReadServiceImagePath(var ImagePath: String): Integer;
+// Reads the ImagePath and ObjectName (the service account) of an existing
+// <ServiceName> service. Results:
+// 0 = both values read, 1 = service key CONFIRMED absent (Test-Path),
+// 2 = the query could not be completed (PowerShell failed to run, the key
+//     exists but the read failed, e.g. access denied, or the read-back file
+//     is missing).
+// REC-01C: only the confirmed absence is "absent". Callers must treat 2 as
+// an error and refuse BEFORE any mutation - "could not read" is never
+// "not there".
+function TryReadServiceImagePath(var ImagePath, ObjectName: String): Integer;
 var
-  TmpFile, PsParams: String;
-  Raw: AnsiString;
+  TmpFile, TmpObjFile, PsParams: String;
+  Raw, RawObj: AnsiString;
   Code: Integer;
 begin
   TmpFile := ExpandConstant('{tmp}\svcimagepath.txt');
+  TmpObjFile := ExpandConstant('{tmp}\svcobjname.txt');
   DeleteFile(TmpFile);
+  DeleteFile(TmpObjFile);
   PsParams := '-NoProfile -Command "$ErrorActionPreference = ''Stop''; ' +
-    'try { (Get-ItemProperty -Path ''HKLM:\SYSTEM\CurrentControlSet\Services\' +
-    ServiceName + ''' -Name ImagePath).ImagePath | Out-File -FilePath ''' +
-    TmpFile + ''' -Encoding ascii; exit 0 } catch { exit 1 }"';
+    '$p = ''HKLM:\SYSTEM\CurrentControlSet\Services\' + ServiceName + '''; ' +
+    'if (-not (Test-Path -Path $p)) { exit 1 } ' +
+    'try { ' +
+    '$v = Get-ItemProperty -Path $p -Name ImagePath, ObjectName; ' +
+    '$v.ImagePath | Out-File -FilePath ''' + TmpFile + ''' -Encoding ascii -Width 8192; ' +
+    '$v.ObjectName | Out-File -FilePath ''' + TmpObjFile + ''' -Encoding ascii -Width 8192; ' +
+    'exit 0 } catch { exit 2 }"';
   if not Exec('powershell.exe', PsParams, '', SW_HIDE, ewWaitUntilTerminated, Code) then
   begin
     Result := 2;
     Exit;
   end;
-  if Code <> 0 then
+  if Code = 1 then
   begin
-    Result := 1; // service key absent
+    Result := 1; // service key confirmed absent
     Exit;
   end;
-  if not LoadStringFromFile(TmpFile, Raw) then
+  if Code <> 0 then
+  begin
+    Result := 2; // key exists but the read failed, or unexpected error
+    Exit;
+  end;
+  if (not LoadStringFromFile(TmpFile, Raw)) or
+     (not LoadStringFromFile(TmpObjFile, RawObj)) then
   begin
     Result := 2;
     Exit;
   end;
-  ImagePath := Raw;
-  // Out-File writes a trailing CRLF; strip trailing whitespace.
-  while (Length(ImagePath) > 0) and
-      ((ImagePath[Length(ImagePath)] = #13) or
-       (ImagePath[Length(ImagePath)] = #10) or
-       (ImagePath[Length(ImagePath)] = ' ')) do
-    ImagePath := Copy(ImagePath, 1, Length(ImagePath) - 1);
+  ImagePath := TrimTail(Raw);
+  ObjectName := TrimTail(RawObj);
   Result := 0;
 end;
 
@@ -325,13 +344,16 @@ end;
 // still executed and overwrote the foreign service's Environment.)
 function ForeignServiceCollision: String;
 var
-  ImagePath, OurPath: String;
+  ImagePath, ObjectName, OurPath: String;
   Res: Integer;
 begin
   Result := '';
-  Res := TryReadServiceImagePath(ImagePath);
+  Res := TryReadServiceImagePath(ImagePath, ObjectName);
   if Res = 2 then
   begin
+    // REC-01C: a read/access error is never "absent" - refuse before any
+    // mutation instead of risking a fresh-install create or repair overwrite
+    // on top of a service we could not see.
     Result := 'could not query the state of the ' + ServiceName + ' service';
     Exit;
   end;
@@ -342,13 +364,15 @@ begin
     HadOurService := False;
     Exit;
   end;
-  // Res = 0: the service exists. It is a repair only when it points at our
-  // executable in THIS install directory.
+  // Res = 0: the service exists. It is a repair only when BOTH the ImagePath
+  // points at our executable in THIS install directory AND the account is
+  // the LocalSystem account sc create leaves in place.
   OurPath := '"' + ExpandConstant('{app}\ThroneCore.exe') + '" service';
-  if CompareText(Trim(ImagePath), OurPath) <> 0 then
+  if (CompareText(Trim(ImagePath), OurPath) <> 0) or
+     (CompareText(Trim(ObjectName), ExpectedServiceAccount) <> 0) then
   begin
-    Result := 'a service named "' + ServiceName + '" already exists but points to: ' +
-      Trim(ImagePath);
+    Result := 'a service named "' + ServiceName + '" already exists but is not ours' +
+      ' (ImagePath: ' + Trim(ImagePath) + ', account: ' + Trim(ObjectName) + ')';
     Exit;
   end;
   // REC-01C: repair over our own service. Capture the Environment before the
@@ -541,7 +565,7 @@ end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
-  App, ImagePath, OurPath: String;
+  App, ImagePath, ObjectName, OurPath: String;
   Res, ResultCode: Integer;
 begin
   App := ExpandConstant('{app}');
@@ -552,18 +576,25 @@ begin
     // service exists the steps are skipped. The service's Environment key
     // is removed by Windows together with the service itself, it is never
     // touched separately.
-    Res := TryReadServiceImagePath(ImagePath);
+    // REC-01C: ownership requires the ImagePath AND the LocalSystem account;
+    // an unreadable state (Res = 2) is never treated as "no service" - the
+    // service is simply left untouched rather than deleted unverified.
+    Res := TryReadServiceImagePath(ImagePath, ObjectName);
     if Res = 0 then
     begin
       OurPath := '"' + App + '\ThroneCore.exe" service';
-      if CompareText(Trim(ImagePath), OurPath) = 0 then
+      if (CompareText(Trim(ImagePath), OurPath) = 0) and
+         (CompareText(Trim(ObjectName), ExpectedServiceAccount) = 0) then
       begin
         Exec(ExpandConstant('{sys}\sc.exe'), 'stop ' + ServiceName, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
         Exec(ExpandConstant('{sys}\sc.exe'), 'delete ' + ServiceName, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
       end
       else
-        Log('Uninstall: service ' + ServiceName + ' belongs to "' + Trim(ImagePath) + '", left untouched');
+        Log('Uninstall: service ' + ServiceName + ' belongs to "' + Trim(ImagePath) +
+            '" (account: ' + Trim(ObjectName) + '), left untouched');
     end
+    else if Res = 2 then
+      Log('Uninstall: could not query the ' + ServiceName + ' service state; the service is left untouched')
     else
       Log('Uninstall: no ' + ServiceName + ' service present');
     StopThrone;
