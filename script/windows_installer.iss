@@ -333,7 +333,8 @@ begin
     Result := 'could not read the captured service Environment from the temporary file';
     Exit;
   end;
-  SavedEnvironment := TrimTail(Raw);
+  SavedEnvironment := Raw; // AnsiString -> String
+  SavedEnvironment := TrimTail(SavedEnvironment);
 end;
 
 // Reads the ImagePath and ObjectName (the service account) of an existing
@@ -384,8 +385,10 @@ begin
     Result := 2;
     Exit;
   end;
-  ImagePath := TrimTail(Raw);
-  ObjectName := TrimTail(RawObj);
+  ImagePath := Raw; // AnsiString -> String
+  ImagePath := TrimTail(ImagePath);
+  ObjectName := RawObj;
+  ObjectName := TrimTail(ObjectName);
   Result := 0;
 end;
 
