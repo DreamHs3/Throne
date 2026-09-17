@@ -1,13 +1,61 @@
 # REC-01 — installer SDDL + hardening (рабочий документ)
 
-Статус: **REC-01 матрица исполнена полностью (2026-09-16/17 ночь + R2-сессия
-2026-09-17 вечер). R1/R4 — VM verified. Reparse-кейс — RUN: отказ
-fail-closed подтверждён, но при reparse на `{app}` payload копируется в цель
-ДО отказа (находка №7, следующий раунд). Protected-dir deny-list — НЕ
-реализован (FAIL, находка №8). Rollback repair-ошибки удаляет существующую
-службу (FAIL, находка №9). Холодные кейсы — вне REC-01.**
+Статус: **REC-01 ЗАКРЫТ (2026-09-18, REC-01C-раунд).** Блокирующие находки
+№7 (payload утекал в junction-цель до отказа), №8 (protected-dir deny-list
+не реализован) и №9 (rollback repair-ошибки удалял существующую службу)
+устранены и VM verified на Setup `15eec3e4…5a49` (source `44108f44`):
+матрица §5.2. Дополнительно закрыты: ownership по учётной записи службы,
+ABSENT/ERROR-контракт TryReadServiceImagePath, ACL-проверка каталога
+бинарника. Принятая задокументированная граница: exit-коды silent-режима
+остаются недостоверными (находка №6) — вердикты только по postconditions.
+Холодные кейсы — вне REC-01.
 Ветка: `agent/rec01-installer-static`
-(a854a45f → 28950f23 → 07685be8; итог `cdd4071010f627bc199c6a3f3891005f88d033a9`).
+(итог раунда REC-01C: `44108f44`; история: `a854a45f` → `28950f23` →
+`cdd40710`).
+
+Провенанс REC-01C: проверенный source = `44108f44`
+(«fix(REC-01C): extract the first Program Files path component…», ветка
+`agent/rec01-installer-static`, push `DreamHs3/GLM_project` fast-forward),
+Setup (service-only test package) = `15eec3e4f41dc20161fb3f404589b42d8f2152bf3ea2e51d37244f3d507e5a49`
+(`artifacts/ProxyCoreSetup-rec01c-final.exe`; собран в госте ISCC 6.7.3 из
+дерева `C:\rec01\src` c этим `.iss`; payload `ThroneCore.exe`
+`5397ef3c…` — архивный, неизменный).
+
+## 5.2 REC-01C раунд (2026-09-17/18, Setup `15eec3e4…5a49` = source `44108f44`)
+
+Канал исполнения: после деградации guestcontrol-spawn — печать payload'ов
+(`go-c1-*.cmd`) в elevated-консоль гостя (evidence, High IL) + файловый
+канал для артефактов. Инцидент канала и жёсткий reset задокументированы в
+`journal.txt` (записи 2026-09-17T21:3x–22:1x) и
+`vm-evidence/recovery/rec01/REC-01C-REPORT.md`.
+
+| # | Кейс | Тест выполнен | Требование выполнено |
+|---|---|---|---|
+| U1 | Базовый silent uninstall (наша служба + LocalSystem) | PASS: exit 0, служба удалена по ownership (ImagePath+account), ключ/Env удалены | да (позитивная ветка ownership) |
+| T4 | Reparse `{app}` junction (jtarget + канарейка) | PASS ×2 (на промежуточном `d481f43d` и финальном `15eec3e4`): **exit 7**, отказ в PrepareToInstall ДО [Files]; jtarget = только канарейка (fc: no differences); служба 1060; data-каталога нет | **да** (находка №7 устранена: payload не утекает) |
+| T5 | Reparse data-каталога (junction `C:\ProgramData\ProxyCore`) | PASS: exit 7, отказ именно на reparse; djtarget не тронут (канарейка цела); `{app}` не создан; служба 1060. **Первый прогон поймал ЛОЖНЫЙ отказ deny-list на дефолтном `{app}`** (баг арифметики первого компонента — исправлен `44108f44`, portable-зеркал-тест добавлен) | **да** (находка доработана и подтверждена) |
+| T7 | Protected dir `/DIR=C:\Windows` | PASS: отказ deny-list «Windows directory subtree», ноль мутаций (нет файлов в C:\Windows, нет службы); exit 1 (silent-путь NextButtonClick — задокументировано) | **да** (находка №8 устранена) |
+| T9 | Foreign same-name service (notepad.exe) | PASS: exit 7, отказ называет ImagePath+account; чужая служба не тронута; файлов/Env нет | да (регресс не выявлен) |
+| T9b | НОВЫЙ: наш ImagePath, чужая учётка (`obj=NT AUTHORITY\LocalService`) | PASS: exit 7, отказ «not ours (ImagePath: <наш>, account: NT AUTHORITY\LocalService)»; служба подмены не тронута, Env не записан | **да** (новое: ownership учитывает учётную запись LocalSystem) |
+| F1 | Fresh install smoke + postconditions | PASS: exit 0; ImagePath заквотирован; ObjectName=LocalSystem; Env 3 значения (грант SID evidence `-1000`); DACL SY+BA; `net start` → RUNNING | да |
+| T3 | Repair при unsafe ACE (Everyone) + sentinel-Environment | PASS: отказ fail-closed (VerifyDataDirAcl), **служба СОХРАНЕНА** (`RollbackService: pre-existing service kept, its previous Environment restored`), **Environment == sentinel байт-в-байт** (restore доказанно перезаписывает), data/app целы; ACE Everyone остаётся (существовал до попытки — не ослабление) | **да** (находка №9 устранена) |
+| T3b | Восстановление: снять ACE + повторный repair | PASS: exit 0, DACL SY+BA (без Everyone), Env = значения установщика, `net start` → RUNNING | да (repair smoke) |
+| T3c | Fresh-rollback: грязный data-каталог БЕЗ службы → fresh install | PASS: отказ VerifyDataDirAcl → **`RollbackService: sc delete exit 0` — удалена только служба этой попытки** (после отказа 1060); первый прогон кейса не сработал из-за гонки с асинхронной зачисткой unins000 (задание пересоздало каталог чистым) — чекер был прав, кейс перезапущен раздельно (t3cA/t3cB) | **да** (rollback удаляет только свою службу) |
+| T6b | Ownership-safe uninstall (foreign takeover notepad) | PASS: `belongs to "…notepad.exe" (account: LocalSystem), left untouched`; служба выжила; файлы удалены | да (регресс не выявлен, лог дополнен account) |
+| ACL | VerifyAppDirAcl (новое) | PASS на дефолтной установке (Program Files ACL: BU/AU/пакеты — только RX; владелец BA) — false positive нет | да (новое требование: каталог бинарника не может быть изменён/подменён обычным пользователем) |
+| GUI | Запуск установленного GUI обычным пользователем | PASS: launch через unelevated Explorer; заголовок **`ProxyCore 0.0.0` без `[Admin]`** (скриншот r2c-07); **token integrity процесса Throne.exe (pid 4536) = S-1-16-8192 Medium** (читано из elevated-контекста High S-1-16-12288) | **да** (non-elevated UI доказан токеном, а не заголовком) |
+
+Snapshot стенда после матрицы: `REC01C-POST` `8162d18a-17f9-4b02-94d0-15452df9cb2a`
+(стенд восстановлен: GUI-пакет `e44b532c…` из cdd40710, служба demand+STOPPED).
+Артефакты: `vm-evidence/recovery/rec01/r2/` (`t4-*`, `t5-*`, `t7-*`, `t9*`,
+`fresh-*`, `t3*`, `t6b-*`, `gui2-*`, `diag-*`, payload'ы `go-c1-*.cmd`,
+консоль `console/r2c-*.png`).
+
+Ограничение честности: полный GUI-пакет из дерева `44108f44` в CI не
+пересобирался (REC-01C меняет только `windows_installer.iss`; GUI-часть не
+затронута; service-only Setup — полный эквивалент инсталлятора для матрицы).
+При следующей CI-сборке полного пакета хэш Setup'а изменится — привязка
+`15eec3e4…` остаётся валидной для проверенной матрицы.
 
 Провенанс: проверенный source = `cdd4071010f627bc199c6a3f3891005f88d033a9`,
 Setup (service-only test package) =
@@ -85,20 +133,34 @@ T2 → `PASS`; T9 → `REFUSED` (exit 7 записан, неtrusted); T3 → `FA
    → **exit 0** (suppressed msgbox). В обоих случаях exit-код не является
    признаком успеха/отказа — вердикт только по postconditions
    (`rec01-setup-verify.ps1`: T2→PASS, T9→REFUSED, T3→FAIL на exit 0).
-7. **Reparse на `{app}`: payload уходит в цель до отказа (R2 T4)** —
+7. **[РЕШЕНА в REC-01C, коммит `aff8be27`, VM verified T4 (§5.2)]**
+   Reparse на `{app}`: payload уходит в цель до отказа (R2 T4) —
    `[Files]` копирует через junction раньше, чем `SetupServiceEnv` проверяет
-   reparse; служба и data при этом чисты. Исправление следующего раунда:
-   перенести reparse-проверку в `PrepareToInstall` (рядом с
-   `ForeignServiceCollision`). Reparse на data-каталоге чист (T5).
-8. **Protected-dir deny-list НЕ реализован (R2 T7 FAIL)**: тихая установка в
-   `C:\Windows` проходит (файлы в `C:\Windows\ProxyCore`). Пункт 2.4
-   (deny-list: корни дисков, Windows, чужие Program Files) — следующий раунд.
-9. **Rollback repair-ошибки уничтожает существующую службу (R2 T3 FAIL)**:
-   `FailStep`→`RollbackService` делает `sc delete` и при repair, хотя при
-   ошибке середины установки существовавшая исправная служба должна
-   сохраняться/восстанавливаться; небезопасный ACE при этом остаётся в DACL.
-   Восстановление: снять ACE + повторный repair (T3b). Исправление: ветка
-   rollback для repair (re-create + env restore) вместо delete.
+   reparse; служба и data при этом чисты. Исправление: reparse-проверка
+   (`ReparsePathViolation`, включая существующие родительские компоненты)
+   перенесена в `PrepareToInstall` до первой записи payload; T4 повторён на
+   `15eec3e4…` — exit 7, цель/канарейка не тронуты. Reparse на data-каталоге
+   чист (T5).
+8. **[РЕШЕНА в REC-01C, коммиты `a53f2ab6`+`9ca6d311`+`44108f44`, VM
+   verified T7 (§5.2)]** Protected-dir deny-list НЕ реализован (R2 T7 FAIL):
+   тихая установка в `C:\Windows` проходила. Исправление:
+   `ProtectedDirViolation` — ОТДЕЛЬНАЯ политика выбора пути (корни дисков,
+   subtree Windows, чужие Program Files; интерактив — NextButtonClick,
+   silent — PrepareToInstall), НЕ замена ACL-проверке `VerifyAppDirAcl`
+   (каталог бинарника: запрет write/delete/reacl/owner для кого-либо кроме
+   SYSTEM/Administrators/CREATOR OWNER/TrustedInstaller). T7 повторён —
+   отказ, ноль мутаций. T5 дополнительно поймал и помог исправить ложный
+   отказ deny-list на дефолтном `{app}` (арифметика первого компонента).
+9. **[РЕШЕНА в REC-01C, коммит `1f6e6e98`, VM verified T3/T3c (§5.2)]**
+   Rollback repair-ошибки уничтожал существующую службу (R2 T3 FAIL):
+   `FailStep`→`RollbackService` делал `sc delete` и при repair. Исправление:
+   PrepareToInstall классифицирует fresh/repair; при repair перед мутациями
+   захватывается Environment (`CaptureServiceEnvironment`, ошибка чтения =
+   отказ до мутаций); rollback сохраняет существующую службу и восстанавливает
+   Environment, удалять может только службу, созданную текущей попыткой
+   (fresh, T3c). T3 повторён: служба сохранена, Environment == sentinel.
+   Восстановление после R2 T3 (снять ACE + re-repair) более не требуется как
+   аварийная процедура — штатный repair (T3b) восстанавливает всё сам.
 10. Стенд (R2): после save/resume гостевой канал guestcontrol деградирует
     (VERR_UNRESOLVED_ERROR, плавающие copyto/run) — лечится перезагрузкой
     гостя; `Register-ScheduledTask -Principal` + `-Password` несовместимы
@@ -108,23 +170,28 @@ T2 → `PASS`; T9 → `REFUSED` (exit 7 записан, неtrusted); T3 → `FA
 
 ## 7. Definition of Done — статус
 
-- **Матрица §3 исполнена полностью** (R2-сессия 5.1): fresh (T2), repair
-  (T3/T3b), чужая одноимённая служба (T6/T9), путь с пробелами (T8), unsafe
-  explicit ACE (T3), reparse dir (T4/T5), SID allow/deny (T2/T10/T9), SCM
-  Running (T8/T11), read-back (все кейсы) — на Setup SHA
-  `ba03f60f…` = source `cdd40710`.
-- Сводка вердиктов: PASS — T1,T2,T3b,T5,T6,T8,T9,T10,T11,GUI;
-  FAIL (находки, не блокируют принятие выполненной матрицы) — T4 (утечка
-  payload до reparse-отказа), T7 (protected-dir не реализован), T3 (rollback
-  repair удаляет существующую службу); NOT RUN — нет.
-- Failure-кейсы воспроизведены и падают fail-closed, КРОМЕ разрушения
-  существующей службы при repair-ошибке (находка №9 — в следующий раунд).
-- Static vs VM verified разделены в этой секции. Не входит: PC-130,
-  kill-switch, холодная матрица (см. CURRENT_STATE §6.1 — cold-start
-  auto-ready BLOCKED, отдельная работа).
-- Сокращённый пакет без Throne.exe (все ночные и R2 прогоны) =
-  **service-only test package**; полный пакет с GUI собран в CI из
-  `cdd40710` (run 35267101876) и проверен на установку+запуск окна (5.1 GUI).
+- **REC-01 ЗАКРЫТ (2026-09-18).** Все блокирующие находки устранены и
+  VM verified на Setup SHA `15eec3e4f41dc20161fb3f404589b42d8f2152bf3ea2e51d37244f3d507e5a49`
+  = source `44108f44` (матрица §5.2); DoD п.1–3 выполнены: матрица §3
+  исполнена на конкретном Setup SHA (R2: `ba03f60f…` = `cdd40710` — история;
+  REC-01C: `15eec3e4…` = `44108f44`), failure-кейсы падают fail-closed БЕЗ
+  разрушения существующего состояния, static vs VM разделены ниже.
+- Сводка вердиктов R2 (Setup `ba03f60f…`, история): PASS —
+  T1,T2,T3b,T5,T6,T8,T9,T10,T11,GUI; FAIL (блокирующие, исправлены в
+  REC-01C — см. §5.2 и находки №7–9): T4, T7, T3. NOT RUN — нет.
+- Сводка вердиктов REC-01C (Setup `15eec3e4…`, §5.2): PASS —
+  U1, T4, T5, T7, T9, T9b, F1, T3, T3b, T3c, T6b, ACL, GUI; NOT RUN — нет.
+- Принятые границы (не блокируют, задокументированы): exit-коды silent
+  (находка №6) — вердикты по postconditions; полный GUI-пакет из дерева
+  `44108f44` в CI не пересобирался (installer-only изменения); «тихие»
+  остатки unins000.exe/`config` после uninstall — старое поведение
+  деинсталлятора, вне REC-01.
+- Не входит: PC-130, kill-switch, холодная матрица (см. CURRENT_STATE §6.1 —
+  cold-start auto-ready BLOCKED, отдельная работа).
+- Сокращённый пакет без Throne.exe (все ночные, R2 и REC-01C прогоны) =
+  **service-only test package**; полный пакет с GUI проверен на установку +
+  запуск (R2 GUI, `e44b532c…`) и на non-elevated запуск (REC-01C GUI: IL
+  Medium, заголовок без `[Admin]`).
 
 ## 1. SDDL fix (R1) — static checked ✓ / VM verified ✗
 

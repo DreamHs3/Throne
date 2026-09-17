@@ -48,7 +48,7 @@ sha256 `a3961cfe9db0d30fd404d7bd63f18db736f2075afedde27cb522b79f2cc24df9`.
 | R1 | P1 | Незакрытый `)` в SDDL ACE в конкатенации `THRONE_SERVICE_SDDL` | `script/windows_installer.iss`, `SetupServiceEnv` | **VM verified** (2026-09-16/17): portable regression зелёный; in-guest парс (RawSecurityDescriptor/ConvertFrom-SddlString) PASS; read-back реестра содержит полную SDDL. Логи: `vm-evidence/recovery/rec01/` |
 | R2 | P1 | `Stop` не ограничен 2-секундным deadline: синхронный Stop до select; Start держит `lifecycleMu` в `boxmain.Create` | `core/server/service_windows.go`, `core/server/server.go` | Открыт → REC-02 |
 | R3 | P1 | Повторный `Start` отложенным cleanup стирает ссылку на работающий runtime (`setBoxInstance(nil,nil)`, сброс mark) | `core/server/server.go` | Открыт → REC-02 |
-| R4 | P1 | Installer не проверяет безопасность цели: `sc`/`icacls` без checked exit codes, repair без ownership-проверки, нет отдельных кавычек вокруг exe в ImagePath, нет reparse-отказа/read-back DACL | `script/windows_installer.iss` | **Implemented + VM verified** (07685be8/cdd40710, Setup `ba03f60f…`; R2-матрица 2026-09-17 — REC-01.md §5.1). Остатки (следующий раунд, находки №7–9): перенос reparse-проверки в PrepareToInstall (payload уходит в цель junction до отказа), protected-dir deny-list (не реализован — T7 FAIL), rollback repair-ошибки удаляет существующую службу (T3 FAIL). Silent exit codes недостоверны (см. REC-01.md §6.6) |
+| R4 | P1 | Installer не проверяет безопасность цели: `sc`/`icacls` без checked exit codes, repair без ownership-проверки, нет отдельных кавычек вокруг exe в ImagePath, нет reparse-отказа/read-back DACL | `script/windows_installer.iss` | **REC-01 ЗАКРЫТ (2026-09-18)**: hardening VM verified (`cdd40710`, Setup `ba03f60f…`) + REC-01C-раунд VM verified (`44108f44`, Setup `15eec3e4…`): находки №7–9 устранены (reparse до payload, deny-list + ACL-проверка каталога, fresh/repair-aware rollback + restore Environment), ownership по ImagePath+учётке, ABSENT/ERROR-контракт чтения службы. Матрица: REC-01.md §5.2. Принятая граница: silent exit codes недостоверны (находка №6) — вердикты по postconditions |
 | R5 | P1 (план) | PC-130 требует UI→service RPC, которых нет: UI поднимает child-core + legacy frame, несовместимый с envelope | `src/sys/Process.cpp`, `src/main.cpp`, `src/api/RPC.cpp` | Открыт → REC-03 (узкий service transport до PC-130) |
 
 ## 4. Какие PASS только исторические (VM PC100-Evidence УДАЛЕНА)
@@ -204,23 +204,23 @@ guestcontrol деградирует (VERR_UNRESOLVED_ERROR на старте с�
   foreign-service EAbort до изменений, repair-кейс, fail-closed на sc-ошибке
   и DACL mismatch. Матрица и находки: `REC-01.md` §5–6;
   артефакты `vm-evidence/recovery/rec01/`.
-- **REC-01 — ЗАВЕРШЁН (R2-сессия 2026-09-17 вечер)**: оставшиеся кейсы
-  исполнены на том же Setup `ba03f60f…` (service-only test package):
-  reparse (RUN; {app}-junction — fail-closed отказ, но payload утекает в цель
-  до отказа), unsafe explicit ACE при repair (fail-closed PASS + FAIL
-  находка: rollback удаляет существующую службу), ownership-safe uninstall
-  (PASS: чужая служба не тронута), protected-dir (FAIL: не реализован),
-  путь с пробелами (PASS: RUNNING), UAC-модель (PASS: грант = SID
-  установившего локального пользователя: `-1001` recagent / `-1000`
-  evidence), тихие exit codes (refuse=7, mid-abort=0 — только
-  postconditions), оркестратор получил postcondition-вердикты
-  (`rec01-setup-verify.ps1`: PASS/REFUSED/FAIL). Полный пакет с GUI собран
-  в CI из `cdd40710` (run 35267101876, `e44b532c…`), установка + запуск окна
-  `[Admin] ProxyCore 0.0.0` — PASS (управление runtime через GUI НЕ
-  заявляется). Таблица: `REC-01.md` §5.1; артефакты
-  `vm-evidence/recovery/rec01/r2/`. Замечания №7–9 — в следующий
-  installer-раунд (вместе с REC-02 не смешивать).
-- Далее: REC-02 (Start/Stop lifecycle).
+- **REC-01 — ЗАКРЫТ (REC-01C-раунд 2026-09-17/18)**: блокирующие находки
+  №7–9 устранены и VM verified на Setup `15eec3e4…5a49` (source `44108f44`,
+  ветка `agent/rec01-installer-static`, push fast-forward в
+  DreamHs3/GLM_project): reparse-отказ до первой записи payload (с
+  родительскими компонентами), fresh/repair-aware rollback (существующая
+  служба сохраняется, Environment восстанавливается; удаляется только служба
+  текущей попытки), TryReadServiceImagePath ABSENT/ERROR + ownership по
+  учётке LocalSystem, ACL-проверка каталога бинарника, protected-dir
+  deny-list (Windows/корни/чужой Program Files — отдельная политика выбора
+  пути). GUI non-elevated: токен Throne.exe = Medium (S-1-16-8192), заголовок
+  без `[Admin]`. Матрица: REC-01.md §5.2; артефакты
+  `vm-evidence/recovery/rec01/` (+ r2/go-c1-*, console/r2c-*, снапшот
+  REC01C-POST `8162d18a…`). История R2 FAIL'ов сохранена в §5.1/§6 со
+  ссылками на исправляющие прогоны. Старое «Замечания №7–9 — в следующий
+  installer-раунд (вместе с REC-02 не смешивать)» — исполнено: installer-раунд
+  сделан ОТДЕЛЬНО, до REC-02.
+- Далее: REC-02 (Start/Stop lifecycle, R2/R3) — ветвить от `44108f44`.
 - Правило веток: следующую задачу ветвить от фактического проверенного
   результата предыдущей.
 
