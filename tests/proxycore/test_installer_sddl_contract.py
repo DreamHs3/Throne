@@ -97,6 +97,68 @@ class InstallerSddlContract(unittest.TestCase):
         self.assertIn("PrivilegesRequiredOverridesAllowed=dialog commandline",
                       source)
 
+    def test_rec01c_refusals_run_before_the_first_payload_write(self):
+        """REC-01C R2 T4/T5/T7: the reparse and protected-dir refusals must be
+        decided in PrepareToInstall (with existing ancestor components), i.e.
+        BEFORE the [Files] section copies anything; the old in-SetupServiceEnv
+        reparse gate ran after [Files] and leaked the payload through the
+        junction."""
+        source = (Path(__file__).resolve().parents[2]
+                  / "script/windows_installer.iss").read_text(encoding="utf-8")
+        prepare = re.search(r"function PrepareToInstall.*?\nend;",
+                            source, re.S).group(0)
+        self.assertIn("InstallTargetViolations", prepare)
+        self.assertIn("ProtectedDirViolation", prepare)
+        self.assertIn("function ReparsePathViolation", source)
+        self.assertIn("function ProtectedDirViolation", source)
+        setupsvc = re.search(r"procedure SetupServiceEnv;.*?\nend;",
+                             source, re.S).group(0)
+        self.assertNotIn("IsReparsePoint", setupsvc)
+        self.assertNotIn("ReparsePathViolation", setupsvc)
+
+    def test_rec01c_rollback_is_fresh_repair_aware(self):
+        """REC-01C R2 T3: a repair failure must keep the pre-existing service
+        and restore its captured Environment; only a fresh attempt (whose
+        guard confirmed the service was absent) may delete the service."""
+        source = (Path(__file__).resolve().parents[2]
+                  / "script/windows_installer.iss").read_text(encoding="utf-8")
+        rollback = re.search(r"procedure RollbackService;.*?\nend;",
+                             source, re.S).group(0)
+        self.assertIn("HadOurService", rollback)
+        self.assertIn("SavedEnvironment", rollback)
+        collision = re.search(r"function ForeignServiceCollision.*?\nend;",
+                              source, re.S).group(0)
+        self.assertIn("CaptureServiceEnvironment", collision)
+
+    def test_rec01c_service_read_errors_are_not_absence(self):
+        """REC-01C: only a confirmed Test-Path miss is 'absent'; read/access
+        errors map to a distinct ERROR result the callers must refuse on, and
+        ownership also requires the expected LocalSystem account."""
+        source = (Path(__file__).resolve().parents[2]
+                  / "script/windows_installer.iss").read_text(encoding="utf-8")
+        reader = re.search(r"function TryReadServiceImagePath.*?\nend;",
+                           source, re.S).group(0)
+        self.assertIn("Test-Path", reader)
+        self.assertIn("ObjectName", reader)
+        self.assertIn("ExpectedServiceAccount = 'LocalSystem'", source)
+
+    def test_rec01c_app_dir_acl_check_and_deny_list(self):
+        """REC-01C R2 T7: the install folder / service binary must be checked
+        for unprivileged write access, and the protected-dir deny-list is a
+        separate path-selection policy (not a replacement for the ACL check)."""
+        source = (Path(__file__).resolve().parents[2]
+                  / "script/windows_installer.iss").read_text(encoding="utf-8")
+        self.assertIn("procedure VerifyAppDirAcl", source)
+        acl = re.search(r"procedure VerifyAppDirAcl;.*?\nend;",
+                        source, re.S).group(0)
+        self.assertIn("ThroneCore.exe", acl)
+        self.assertIn("TakeOwnership", acl)
+        self.assertIn("S-1-5-32-544", acl)  # Administrators allow-list
+        policy = re.search(r"function ProtectedDirViolation.*?\nend;",
+                           source, re.S).group(0)
+        for needle in ("{win}", "{commonpf}", "{commonpf32}"):
+            self.assertIn(needle, policy)
+
 
 if __name__ == "__main__":
     unittest.main()
