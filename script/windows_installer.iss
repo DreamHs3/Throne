@@ -105,6 +105,16 @@ var
   // anchored below it lands off-page (the exact "caption set but invisible"
   // symptom of both previous attempts).
   ServiceNoticeLabel: TNewStaticText;
+  // REC-01C: install classification prepared in PrepareToInstall, before any
+  // mutation. HadOurService=True means the service already existed and is
+  // ours (repair): rollback must KEEP it and restore SavedEnvironment.
+  // HadOurService=False means fresh: the only service that can exist on a
+  // failure is the one created by this attempt, and only that one may be
+  // deleted (R2 T3 FAIL: repair rollback deleted the pre-existing service).
+  HadOurService: Boolean;
+  // The pre-existing service Environment, one value per line ('' when its
+  // absence was confirmed), captured before the attempt overwrites it.
+  SavedEnvironment: String;
 
 // ---------------------------------------------------------------------------
 // REC-01 (R4) hardening helpers. Every privileged mutation is followed by a
@@ -165,8 +175,30 @@ end;
 procedure RollbackService;
 var
   Code: Integer;
+  PsParams, SrcFile: String;
 begin
-  // Best effort: 1060 (not installed) is fine here.
+  if HadOurService then
+  begin
+    // REC-01C: a repair failure must neither delete the pre-existing service
+    // (R2 T3 FAIL) nor leave the Environment half-rewritten by this attempt,
+    // so the values captured in PrepareToInstall go back verbatim. Best
+    // effort only: the setup run is already failing.
+    if SavedEnvironment = '' then
+      PsParams := '-NoProfile -Command "$ErrorActionPreference = ''Stop''; Remove-ItemProperty -Path ''HKLM:\SYSTEM\CurrentControlSet\Services\' + ServiceName + ''' -Name Environment -ErrorAction SilentlyContinue; exit 0"'
+    else
+    begin
+      SrcFile := ExpandConstant('{tmp}\svcenv-saved.txt');
+      PsParams := '-NoProfile -Command "$ErrorActionPreference = ''Stop''; $v = Get-Content -LiteralPath ''' + SrcFile + '''; Set-ItemProperty -Path ''HKLM:\SYSTEM\CurrentControlSet\Services\' + ServiceName + ''' -Name Environment -Type MultiString -Value $v; exit 0"';
+    end;
+    if Exec('powershell.exe', PsParams, '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0) then
+      Log('RollbackService: pre-existing service kept, its previous Environment restored')
+    else
+      Log('RollbackService: FAILED to restore the pre-existing service Environment (exit ' + IntToStr(Code) + ')');
+    Exit;
+  end;
+  // Fresh install: ForeignServiceCollision confirmed the service was absent
+  // in PrepareToInstall, so the only service that can exist here is the one
+  // THIS attempt created - deleting it is safe and expected.
   Exec(ExpandConstant('{sys}\sc.exe'), 'delete ' + ServiceName, '',
     SW_HIDE, ewWaitUntilTerminated, Code);
   Log('RollbackService: sc delete exit ' + IntToStr(Code));
@@ -186,10 +218,65 @@ procedure FailStep(const What, Detail: String);
 begin
   Log(What + ' FAILED: ' + Detail);
   SuppressibleMsgBox(What + ' failed: ' + Detail + #13#10#13#10 +
-    'Setup rolls back the service it created and aborts.',
+    'Setup aborts: a service created by this attempt is removed; a ' +
+    'pre-existing service is kept with its saved Environment.',
     mbError, MB_OK, IDOK);
   RollbackService;
   RaiseException(What + ' failed: ' + Detail);
+end;
+
+// Out-File writes a trailing CRLF; strip trailing CR/LF/space characters.
+function TrimTail(const S: String): String;
+begin
+  Result := S;
+  while (Length(Result) > 0) and
+      ((Result[Length(Result)] = #13) or
+       (Result[Length(Result)] = #10) or
+       (Result[Length(Result)] = ' ')) do
+    Result := Copy(Result, 1, Length(Result) - 1);
+end;
+
+// REC-01C: captures the current REG_MULTI_SZ Environment of <ServiceName>
+// into SavedEnvironment ({tmp}\svcenv-saved.txt, one value per line) so a
+// failed repair can put it back. Returns '' on success - including a
+// CONFIRMED absence of the value (exit 1), for which the restore target is
+// "no Environment" - or a refusal message on read errors, so a repair whose
+// previous state cannot be captured never mutates anything.
+function CaptureServiceEnvironment: String;
+var
+  TmpFile, PsParams: String;
+  Raw: AnsiString;
+  Code: Integer;
+begin
+  Result := '';
+  SavedEnvironment := '';
+  TmpFile := ExpandConstant('{tmp}\svcenv-saved.txt');
+  DeleteFile(TmpFile);
+  PsParams := '-NoProfile -Command "$ErrorActionPreference = ''Stop''; ' +
+    '$p = ''HKLM:\SYSTEM\CurrentControlSet\Services\' + ServiceName + '''; ' +
+    'try { if (-not (Test-Path -Path $p)) { exit 9 }; ' +
+    '$k = Get-Item -Path $p; ' +
+    'if ($k.GetValueNames() -notcontains ''Environment'') { exit 1 }; ' +
+    '$k.GetValue(''Environment'') | Out-File -FilePath ''' + TmpFile + ''' -Encoding ascii -Width 8192; exit 0 } ' +
+    'catch { exit 9 }"';
+  if not Exec('powershell.exe', PsParams, '', SW_HIDE, ewWaitUntilTerminated, Code) then
+  begin
+    Result := 'could not query the existing service Environment';
+    Exit;
+  end;
+  if Code = 1 then
+    Exit; // confirmed absent: restore target is "no Environment value"
+  if Code <> 0 then
+  begin
+    Result := 'could not read the existing service Environment';
+    Exit;
+  end;
+  if not LoadStringFromFile(TmpFile, Raw) then
+  begin
+    Result := 'could not read the captured service Environment from the temporary file';
+    Exit;
+  end;
+  SavedEnvironment := TrimTail(Raw);
 end;
 
 // Reads the ImagePath of an existing <ServiceName> service. Results:
@@ -244,14 +331,30 @@ begin
   Result := '';
   Res := TryReadServiceImagePath(ImagePath);
   if Res = 2 then
-    Result := 'could not query the state of the ' + ServiceName + ' service';
-  if Res = 0 then
   begin
-    OurPath := '"' + ExpandConstant('{app}\ThroneCore.exe') + '" service';
-    if CompareText(Trim(ImagePath), OurPath) <> 0 then
-      Result := 'a service named "' + ServiceName + '" already exists but points to: ' +
-        Trim(ImagePath);
+    Result := 'could not query the state of the ' + ServiceName + ' service';
+    Exit;
   end;
+  if Res = 1 then
+  begin
+    // Confirmed absent: fresh install. Any service that exists on a later
+    // failure was created by this attempt and may be rolled back.
+    HadOurService := False;
+    Exit;
+  end;
+  // Res = 0: the service exists. It is a repair only when it points at our
+  // executable in THIS install directory.
+  OurPath := '"' + ExpandConstant('{app}\ThroneCore.exe') + '" service';
+  if CompareText(Trim(ImagePath), OurPath) <> 0 then
+  begin
+    Result := 'a service named "' + ServiceName + '" already exists but points to: ' +
+      Trim(ImagePath);
+    Exit;
+  end;
+  // REC-01C: repair over our own service. Capture the Environment before the
+  // attempt touches it; a capture error refuses the whole install.
+  HadOurService := True;
+  Result := CaptureServiceEnvironment;
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
