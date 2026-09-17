@@ -177,6 +177,58 @@ begin
     Result := ReparsePathViolation(ExpandConstant('{commonappdata}\ProxyCore'));
 end;
 
+// REC-01C: protected-target policy for admin installs - a PATH-SELECTION
+// deny-list, deliberately separate from the DACL verification in
+// VerifyAppDirAcl: a directory under C:\Windows is admin-owned and read-only
+// for users, so it would pass an ACL check while still being an unacceptable
+// install target (R2 T7 FAIL). <Dir> must be the RESOLVED directory Setup
+// would actually create (NextButtonClick already appended ProxyCore).
+function ProtectedDirViolation(const Dir: String): String;
+var
+  D, P, Pf, Rest: String;
+begin
+  Result := '';
+  D := RemoveBackslashUnlessRoot(Dir);
+  // (a) the area directly inside a drive root.
+  P := D;
+  while (Length(P) > 0) and (P[Length(P)] <> '\') do
+    P := Copy(P, 1, Length(P) - 1);
+  if Length(P) = 3 then // parent is a drive root like 'C:\'
+  begin
+    Result := 'installing into the root area of a drive is not allowed (' + D + ')';
+    Exit;
+  end;
+  // (b) the Windows directory subtree (includes {sys}).
+  Pf := RemoveBackslashUnlessRoot(ExpandConstant('{win}'));
+  if Pos(Uppercase(AddBackslash(Pf)), Uppercase(AddBackslash(D))) = 1 then
+  begin
+    Result := 'installing into the Windows directory subtree is not allowed (' + D + ')';
+    Exit;
+  end;
+  // (c) Program Files areas: only our own 'ProxyCore' folder is accepted as
+  // the first component; every other application's area is foreign.
+  Rest := '';
+  Pf := RemoveBackslashUnlessRoot(ExpandConstant('{commonpf}'));
+  if Pos(Uppercase(AddBackslash(Pf)), Uppercase(AddBackslash(D))) = 1 then
+    Rest := Copy(AddBackslash(D), Length(AddBackslash(Pf)) + 1, MaxInt)
+  else
+  begin
+    Pf := RemoveBackslashUnlessRoot(ExpandConstant('{commonpf32}'));
+    if Pos(Uppercase(AddBackslash(Pf)), Uppercase(AddBackslash(D))) = 1 then
+      Rest := Copy(AddBackslash(D), Length(AddBackslash(Pf)) + 1, MaxInt);
+  end;
+  if Rest <> '' then
+  begin
+    // first path component inside the Program Files root
+    P := Copy(Rest, 2, MaxInt);
+    while (Length(P) > 0) and (P[Length(P)] <> '\') do
+      P := Copy(P, 1, Length(P) - 1);
+    P := Copy(P, 1, Length(P) - 1);
+    if CompareText(P, 'ProxyCore') <> 0 then
+      Result := 'installing into another application''s Program Files area is not allowed (' + D + ')';
+  end;
+end;
+
 procedure RollbackService;
 var
   Code: Integer;
@@ -384,9 +436,13 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
-  // REC-01C: reparse refusal for install/data paths runs before ANY change -
-  // files, service, Environment, ACL - in both per-user and admin mode.
-  Result := InstallTargetViolations;
+  // REC-01C: read-only refusal checks, all before the first payload write.
+  // Order: protected-target policy (admin), reparse paths (both modes), the
+  // service state (admin) which also classifies fresh vs repair.
+  if IsAdminInstallMode then
+    Result := ProtectedDirViolation(ExpandConstant('{app}'));
+  if Result = '' then
+    Result := InstallTargetViolations;
   if (Result = '') and IsAdminInstallMode then
     Result := ForeignServiceCollision;
   if Result <> '' then
@@ -405,7 +461,7 @@ end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
-  Dir, Probe: String;
+  Dir, Probe, V: String;
   Created: Boolean;
 begin
   Result := True;
@@ -419,7 +475,18 @@ begin
     WizardForm.DirEdit.Text := Dir;
   end;
   if IsAdminInstallMode then
+  begin
+    // REC-01C: protected-target deny-list is path selection - interactive
+    // users are stopped here so they can pick another folder; silent
+    // installs are refused by the same rule in PrepareToInstall.
+    V := ProtectedDirViolation(Dir);
+    if V <> '' then
+    begin
+      SuppressibleMsgBox('"' + Dir + '" cannot be used as the installation folder: ' + V + '.', mbError, MB_OK, IDOK);
+      Result := False;
+    end;
     Exit;
+  end;
   Created := not DirExists(Dir);
   Probe := AddBackslash(Dir) + '.throne-write-test';
   Result := ForceDirectories(Dir) and SaveStringToFile(Probe, '', False);
@@ -488,6 +555,45 @@ begin
   if not Exec('powershell.exe', PsParams, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
     FailStep('VerifyDataDirAcl', 'service data folder DACL read-back is not SYSTEM+Administrators-only (PowerShell exit code ' + IntToStr(ResultCode) + ')');
   Log('VerifyDataDirAcl: DACL verified as inheritance-disabled SYSTEM+Administrators');
+  // REC-01C: with the data folder verified, verify the install folder too.
+  VerifyAppDirAcl;
+end;
+
+// REC-01C: the install folder and the service binary must not be modifiable
+// or replaceable by unprivileged principals - neither a writable exe ACE nor
+// folder rights that allow planting/renaming/deleting files next to it
+// (write/create/append/delete/delete-child/reacl/take-ownership) may be
+// granted to anyone except SYSTEM, Administrators, CREATOR OWNER or
+// TrustedInstaller, and the owner (who can always rewrite the DACL) must be
+// one of the privileged principals. Default Program Files ACLs grant
+// Users/Authenticated Users/app packages read+execute only and pass; the
+// check runs in admin mode at the end of the icacls chain above, after
+// [Files] has produced the binary.
+procedure VerifyAppDirAcl;
+var
+  AppDir, ExePath, PsParams: String;
+  ResultCode: Integer;
+begin
+  AppDir := ExpandConstant('{app}');
+  ExePath := AppDir + '\ThroneCore.exe';
+  PsParams := '-NoProfile -Command "$ErrorActionPreference = ''Stop''; ' +
+    '$m = [System.Security.AccessControl.FileSystemRights]''AppendData, WriteData, WriteAttributes, WriteExtendedAttributes, DeleteSubdirectoriesAndFiles, Delete, ChangePermissions, TakeOwnership''; ' +
+    '$ti = ''S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464''; ' +
+    '$ok = $true; $why = ''''; ' +
+    'foreach ($p in @(''' + AppDir + ''',''' + ExePath + ''')) { ' +
+    'try { $a = Get-Acl -LiteralPath $p; ' +
+    '$o = $a.Owner; ' +
+    'try { $o = (New-Object System.Security.Principal.NTAccount($a.Owner)).Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { }; ' +
+    'if (($o -ne ''S-1-5-18'') -and ($o -ne ''S-1-5-32-544'') -and ($o -ne $ti)) { $ok = $false; $why = $why + $p + '':owner:'' + $a.Owner + '';'' } ' +
+    'foreach ($r in $a.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) { ' +
+    'if (($r.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow) -and (([int]$r.FileSystemRights -band [int]$m) -ne 0)) { ' +
+    '$t = $r.IdentityReference.Value; ' +
+    'if (($t -ne ''S-1-5-18'') -and ($t -ne ''S-1-5-32-544'') -and ($t -ne ''S-1-3-0'') -and ($t -ne $ti)) { $ok = $false; $why = $why + $p + '':'' + $t + '':'' + $r.FileSystemRights + '';'' } } } } ' +
+    'catch { $ok = $false; $why = $why + $p + '':unreadable:'' } } ' +
+    'if ($ok) { exit 0 } else { Write-Output $why; exit 1 }"';
+  if not Exec('powershell.exe', PsParams, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+    FailStep('VerifyAppDirAcl', 'the install folder or its service binary is writable or replaceable by a non-administrative principal (exit code ' + IntToStr(ResultCode) + ')');
+  Log('VerifyAppDirAcl: install folder and service binary are not writable by unprivileged principals');
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
