@@ -128,6 +128,40 @@ begin
     ((Attr and FILE_ATTRIBUTE_REPARSE_POINT) <> 0);
 end;
 
+// REC-01C: checks <Dir> and every EXISTING ancestor component. A missing leaf
+// cannot be a reparse point, but a junction anywhere further up the chain
+// redirects the payload just the same, so the walk must not stop at the
+// components that do not exist yet.
+function ReparsePathViolation(const Dir: String): String;
+var
+  P: String;
+begin
+  Result := '';
+  P := RemoveBackslashUnlessRoot(Dir);
+  while Length(P) > 3 do
+  begin
+    if DirExists(P) and IsReparsePoint(P) then
+    begin
+      Result := P + ' is a reparse point (junction or symlink)';
+      Exit;
+    end;
+    while (Length(P) > 0) and (P[Length(P)] <> '\') do
+      P := Copy(P, 1, Length(P) - 1);
+    P := RemoveBackslashUnlessRoot(P);
+  end;
+end;
+
+// REC-01C: called from PrepareToInstall, i.e. BEFORE the [Files] section
+// writes the first payload byte. (R2 T4: the old check lived at the top of
+// SetupServiceEnv, which runs after [Files]; the payload was already copied
+// through an {app} junction into the target by the time Setup refused.)
+function InstallTargetViolations: String;
+begin
+  Result := ReparsePathViolation(ExpandConstant('{app}'));
+  if (Result = '') and IsAdminInstallMode then
+    Result := ReparsePathViolation(ExpandConstant('{commonappdata}\ProxyCore'));
+end;
+
 procedure RollbackService;
 var
   Code: Integer;
@@ -223,12 +257,13 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
-  if IsAdminInstallMode then
-  begin
+  // REC-01C: reparse refusal for install/data paths runs before ANY change -
+  // files, service, Environment, ACL - in both per-user and admin mode.
+  Result := InstallTargetViolations;
+  if (Result = '') and IsAdminInstallMode then
     Result := ForeignServiceCollision;
-    if Result <> '' then
-      Log('PrepareToInstall: refusing to continue - ' + Result);
-  end;
+  if Result <> '' then
+    Log('PrepareToInstall: refusing to continue - ' + Result);
 end;
 
 // No legacy Throne lookup here: ProxyCore must never install into (or
@@ -284,9 +319,6 @@ var
   ResultCode: Integer;
 begin
   DataDir := ExpandConstant('{commonappdata}\ProxyCore');
-  // R4: refuse reparse-point targets before anything is mutated.
-  if IsReparsePoint(ExpandConstant('{app}')) or IsReparsePoint(DataDir) then
-    FailStep('SetupServiceEnv', 'install or data folder is a reparse point');
   User := GetUserNameString;
   TmpFile := ExpandConstant('{tmp}\ownersid.txt');
   // Windows PowerShell 5.1 exits 0 even after non-terminating errors, so
