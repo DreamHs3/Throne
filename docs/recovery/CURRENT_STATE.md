@@ -46,8 +46,8 @@ sha256 `a3961cfe9db0d30fd404d7bd63f18db736f2075afedde27cb522b79f2cc24df9`.
 | ID | Приоритет | Суть | Где | Статус |
 |---|---|---|---|---|
 | R1 | P1 | Незакрытый `)` в SDDL ACE в конкатенации `THRONE_SERVICE_SDDL` | `script/windows_installer.iss`, `SetupServiceEnv` | **VM verified** (2026-09-16/17): portable regression зелёный; in-guest парс (RawSecurityDescriptor/ConvertFrom-SddlString) PASS; read-back реестра содержит полную SDDL. Логи: `vm-evidence/recovery/rec01/` |
-| R2 | P1 | `Stop` не ограничен 2-секундным deadline: синхронный Stop до select; Start держит `lifecycleMu` в `boxmain.Create` | `core/server/service_windows.go`, `core/server/server.go` | Открыт → REC-02 |
-| R3 | P1 | Повторный `Start` отложенным cleanup стирает ссылку на работающий runtime (`setBoxInstance(nil,nil)`, сброс mark) | `core/server/server.go` | Открыт → REC-02 |
+| R2 | P1 | `Stop` не ограничен 2-секундным deadline: синхронный Stop до select; Start держит `lifecycleMu` в `boxmain.Create` | `core/server/service_windows.go`, `core/server/server.go` | **VM verified + unit red/green (REC-02, 2026-09-18, `3f63ef7c`)**: bounded lock-wait (TryLock 2с, отказ вместо clean-stop), bounded close (`runCloseBounded`), bounded service stop boundary; F7-mark гарантирует отсутствие runtime после Stopped. Регрессии red на базе/ green после. `REC-02.md` §3–5 |
+| R3 | P1 | Повторный `Start` отложенным cleanup стирает ссылку на работающий runtime (`setBoxInstance(nil,nil)`, сброс mark) | `core/server/server.go` | **VM verified + unit red/green (REC-02, `130bc51e`)**: duplicate-Start проверка перенесена до армирования cleanup; регрессия: дубль-Start отказан, instance/mark целы, Stop закрывает. `REC-02.md` §2 |
 | R4 | P1 | Installer не проверяет безопасность цели: `sc`/`icacls` без checked exit codes, repair без ownership-проверки, нет отдельных кавычек вокруг exe в ImagePath, нет reparse-отказа/read-back DACL | `script/windows_installer.iss` | **REC-01 ЗАКРЫТ (2026-09-18)**: hardening VM verified (`cdd40710`, Setup `ba03f60f…`) + REC-01C-раунд VM verified (`44108f44`, Setup `15eec3e4…`): находки №7–9 устранены (reparse до payload, deny-list + ACL-проверка каталога, fresh/repair-aware rollback + restore Environment), ownership по ImagePath+учётке, ABSENT/ERROR-контракт чтения службы. Матрица: REC-01.md §5.2. Принятая граница: silent exit codes недостоверны (находка №6) — вердикты по postconditions |
 | R5 | P1 (план) | PC-130 требует UI→service RPC, которых нет: UI поднимает child-core + legacy frame, несовместимый с envelope | `src/sys/Process.cpp`, `src/main.cpp`, `src/api/RPC.cpp` | Открыт → REC-03 (узкий service transport до PC-130) |
 
@@ -220,7 +220,17 @@ guestcontrol деградирует (VERR_UNRESOLVED_ERROR на старте с�
   ссылками на исправляющие прогоны. Старое «Замечания №7–9 — в следующий
   installer-раунд (вместе с REC-02 не смешивать)» — исполнено: installer-раунд
   сделан ОТДЕЛЬНО, до REC-02.
-- Далее: REC-02 (Start/Stop lifecycle, R2/R3) — ветвить от `44108f44`.
+- Далее: **REC-02 — ВЫПОЛНЕНА (2026-09-18)**: ветка `agent/rec02-lifecycle`
+  от `59f28d3b` (`130bc51e` R3, `3f63ef7c` R2): duplicate-Start больше не
+  стирает работающий runtime (регрессия red/green), stop path ограничен на
+  трёх границах (lifecycle lock 2s, box close 2s, service stop boundary 2s;
+  F7-mark гарантирует no-survivor и запрет поздней публикации). Windows
+  runtime tests: полный suite PASS (кроме средозависимого winipcfg, падает
+  и на базе — вне REC-02); red-on-base проверен; SCM smoke в госте: 3 цикла
+  start/stop, stop 2.53–2.55s bounded. Отчёт: `docs/recovery/REC-02.md`;
+  evidence: `vm-evidence/recovery/rec02/`.
+- Далее: REC-03 (service envelope client + минимальный UI smoke) —
+  зависимости REC-01/02 закрыты.
 - Правило веток: следующую задачу ветвить от фактического проверенного
   результата предыдущей.
 
