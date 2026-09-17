@@ -189,13 +189,12 @@ var
 begin
   Result := '';
   D := RemoveBackslashUnlessRoot(Dir);
-  // (a) the area directly inside a drive root.
-  P := D;
-  while (Length(P) > 0) and (P[Length(P)] <> '\') do
-    P := Copy(P, 1, Length(P) - 1);
-  if Length(P) = 3 then // parent is a drive root like 'C:\'
+  // (a) the drive root itself as the target (payload files would land next
+  // to the system folders). Dedicated first-level FOLDERS stay allowed - a
+  // spaced root-level dir like "C:\rec01 sp ace" is a supported case (R2 T8).
+  if Length(D) <= 3 then
   begin
-    Result := 'installing into the root area of a drive is not allowed (' + D + ')';
+    Result := 'installing into a drive root is not allowed (' + D + ')';
     Exit;
   end;
   // (b) the Windows directory subtree (includes {sys}).
@@ -223,7 +222,8 @@ begin
     P := Copy(Rest, 2, MaxInt);
     while (Length(P) > 0) and (P[Length(P)] <> '\') do
       P := Copy(P, 1, Length(P) - 1);
-    P := Copy(P, 1, Length(P) - 1);
+    if Length(P) > 0 then
+      P := Copy(P, 1, Length(P) - 1);
     if CompareText(P, 'ProxyCore') <> 0 then
       Result := 'installing into another application''s Program Files area is not allowed (' + D + ')';
   end;
