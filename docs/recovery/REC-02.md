@@ -1,13 +1,15 @@
-# REC-02 — жизненный цикл Start/Stop (R2/R3) — рабочий документ
+# REC-02 — жизненный цикл Start/Stop (R2/R3/R2B) — рабочий документ
 
 Статус: **исправления implemented + Windows unit verified + SCM smoke VM
-verified (2026-09-18).** Ветка `agent/rec02-lifecycle`
-(`130bc51e` = R3, `3f63ef7c` = R2; база `59f28d3b` — закрытый REC-01).
+verified + fault-сценарии VM verified (2026-09-18).** Ветка
+`agent/rec02-lifecycle` (`130bc51e` = R3, `3f63ef7c` = R2, `a8972e84` +
+`af97fbb2` + `3308aa8b` = REC-02B; база `59f28d3b` — закрытый REC-01).
 
-Файлы: `core/server/server.go` (узкий diff: Start/Stop), `core/server/
-service_windows.go` (граница остановки службы), `core/server/internal/boxbox/
-api.go` (бюджет закрытия). Runtime (boxmain/box.go) не переписывался — по
-условию задачи; legacy child-поведение за пределами дефектов не менялось.
+Файлы: `core/server/server.go` (Start/Stop), `core/server/
+service_windows.go` (граница остановки службы), `core/server/internal/
+boxbox/api.go` (бюджет закрытия, явный исход). Runtime (boxmain/box.go)
+не переписывался — по условию задачи; legacy child-поведение за пределами
+дефектов не менялось.
 
 ## 1. Дефекты (REVIEW_RU.md)
 
@@ -22,6 +24,13 @@ api.go` (бюджет закрытия). Runtime (boxmain/box.go) не пере�
   работающий runtime (`setBoxInstance(nil, nil)`) и сбрасывал
   `autoRedirectMark`: бокс продолжал работать, следующий Stop видел nil,
   Health лгал.
+- **REC-02B (обзор 2026-09-18)**: bounded-ожидание закрытия ошибочно
+  принималось за завершённый teardown. Stop возвращал пустой `ErrorResp`
+  (успех) независимо от исхода close; повторный Stop видел только
+  `currentBox()==nil`, пока close ещё работал в фоне; SCM-граница
+  отбрасывала результат Stop (`_, _ = globalServer.Stop`) и записывала
+  ЛЮБОЙ исход, включая неподтверждённый cleanup, как успешную остановку
+  службы.
 
 ## 2. Исправления
 
@@ -45,64 +54,159 @@ api.go` (бюджет закрытия). Runtime (boxmain/box.go) не пере�
 3. **Service boundary**: `Execute` (svc.Stop) ждёт `globalServer.Stop` в
    горутине с бюджетом 2с; после дедлайна teardown принадлежит F7-mark
    (shutdown mark поднимается до этого синхронно, O(1)): поздний Start
-   разворачивает собственный runtime и отказывает — публикация runtime
-   после Stopped невозможна, Stopped не является ложным clean-stop
-   (обязательное условие ревью). Process fail-stop не потребовался.
+   разворачивает собственный runtime и отказывает. Process fail-stop не
+   потребовался. (Поправлено REC-02B — см. §6: сама по себе F7-mark НЕ
+   является гарантией no-survivor.)
 
-## 3. Регрессии (red на базе `59f28d3b` / green на `3f63ef7c`) — проверено
+### REC-02B (`a8972e84`, `af97fbb2`, `3308aa8b`)
 
-| Тест | База (red) | Фикс (green) |
+1. **Явный исход закрытия** (`boxbox/api.go`): `CloseWithTimeout`
+   возвращает `CloseCompleted` / `CloseFailed` / `CloseTimedOut` (с ошибкой
+   close), плюс хук `onDone(error)`, который исполняется на горутине close
+   ПОСЛЕ реального завершения — каким бы поздним оно ни было.
+2. **Владение teardown'ом** (`server.go`): Stop публикует экземпляр до
+   закрытия, а при `CloseTimedOut` регистрирует teardown-record:
+     - `Start` отказывает («teardown is still in progress») — второй
+     runtime поверх закрывающегося не создаётся;
+   - повторный Stop видит незавершённое закрытие: ждёт (bounded, 2с) и
+     сообщает реальный исход вместо чистой остановки;
+   - record снимается в хуке при реальном завершении close (только если
+     это всё ещё та же запись).
+   `CloseFailed` всплывает в ответе Stop («runtime close failed: ...») без
+   регистрации записи (ничего не осталось работать в фоне).
+3. **SCM-граница** (`service_windows.go`): результат остановки проверяется
+   явно — подтверждение только при nil Go error И пустом `ErrorResp`.
+   Ошибка Go, ошибка в `ErrorResp` или тайм-аут бюджета (2с) =
+   НЕПОДТВЕРЖДЁННЫЙ cleanup: строка в журнале с префиксом `service stop:`
+   и код `svcExitStopUnconfirmed` (2) как service-specific exit code
+   (`sc query`: WIN32_EXIT_CODE 1066, SERVICE_EXIT_CODE 2), никогда не
+   чистая остановка. Ограниченный аварийный путь — выход процесса после
+   Stopped: `svc.Run` возвращается, `main` завершается, процесс умирает,
+   уничтожая внутрипроцессный runtime вместе со всеми горутинами teardown.
+   Именно ЭТОТ выход — гарантия no-survivor на границе (доказан в VM:
+   исчезновение PID службы); F7-mark лишь отказывает новым запускам.
+   Self-teardown в post-check `ServiceStart` логирует неподтверждённый
+   исход тем же префиксом.
+4. **Exit code доходит до SCM** (`3308aa8b`, дефект из VM-evidence):
+   Execute больше не шлёт `Stopped` в status-канал — этот посыл
+   финализировал запись SCM с кодами 0/0 ДО того, как x/sys прикладывал
+   код возврата (в VM-прогоне неиндексированный cleanup выглядел как
+   успешная остановка). По контракту x/sys svc Stopped репортит сам
+   рантайм после возврата Execute; первый возвращаемый параметр —
+   `svcSpecificEC` (не «fire»).
+5. **Диагностика** (`af97fbb2`): `THRONE_SERVICE_LOG` — необязательный
+   путь файла, в который service-режим зеркалирует журнал (SCM не
+   показывает ни stdout, ни stderr; без этого строки stop-пути
+   ненаблюдаемы в реальной службе). По умолчанию выключен.
+
+## 3. Регрессии (REC-02B — green на `3308aa8b`; red-обоснование на базе
+`4644d4b0`) — проверено на хосте Windows
+
+| Тест | База 4644d4b0 | Фикс |
 |---|---|---|
-| `TestDuplicateStartPreservesRunningRuntime` | FAIL 0.01s: «duplicate Start erased the running runtime reference» | PASS: дубль-Start отказан, instance/mark целы (mark==7777), последующий Stop закрыл runtime; repeated Stop идемпотентен; реальная ошибка startup (кривой config) не публикует runtime |
-| `TestServiceExecuteStopBoundedWithHeldLifecycleLock` | FAIL 10.0s: «Execute did not return after a Stop request while the lifecycle lock was held (unbounded stop)» | PASS 2.0s: Stopped достигнут при РЕАЛЬНО удержанном `lifecycleMu` (не mock-delegate), mark поднята, поздний `ServiceStart` отказан (`errServiceStopping`) |
-| `TestRunCloseBoundedReturnsPastDeadline` (boxbox) | — (шов `runCloseBounded` новый) | PASS: возврат по дедлайну при зависшем close, warning залогирован, close дорабатывается в фоне |
-| `TestServiceExecuteStopBoundedWithStartInsideCreation` (существующий, mock-delegate) | PASS | PASS (не регрессировал) |
+| `TestStopReportsTimeoutWhenCloseHangs` | — (швы новые) | PASS: зависший close → Stop сообщает timeout; Start при незавершённом закрытии отказан (второй runtime не создан); повторный Stop сообщает незавершённое закрытие; после завершения close record снят, Start и чистый Stop работают |
+| `TestStopReportsCloseErrorNotClean` | — | PASS: ошибка close всплывает в ответе Stop, без teardown-record |
+| `TestServiceExecuteStopResultAtBoundary` (4 кейса) | — | PASS: чистый Stop → код 0; Go error / ErrorResp / превышение бюджета → `svcExitStopUnconfirmed`, bounded |
+| `TestServiceExecuteStartInsideCreationNoLatePublication` | — | PASS: Start внутри создания держит lifecycleMu как реальное создание; SCM-стоп против удержания → UNCONFIRMED код; Stopped при всё ещё припаркованном Start; затем создание возобновляется, РЕАЛЬНО публикует runtime, post-check сносит: нет публикации после Stopped, нет record, нет Xray/extra process |
+| `TestServiceExecuteStopBoundedWithHeldLifecycleLock` (R2) | PASS 2.0s c кодом 0 — **ложный clean-stop при удержанном lock (red по существу REC-02B)** | PASS 2.0s c кодом `svcExitStopUnconfirmed` |
+| boxbox: `TestRunCloseBoundedReturnsPastDeadline` + 2 новых | — | PASS: (false,nil) по дедлайну; ошибка быстрого close — в ответе и хуке; позднее завершение — только через хук |
+| `TestDuplicateStartPreservesRunningRuntime` (R3) | PASS | PASS (не регрессировал) |
 
 Windows runtime tests: полный `go test ./...` в `core/server` — PASS
 (`ThroneCore`, `internal/boxbox`, xray, xraydns); исключение —
 `internal/boxdns/winipcfg` (8 тестов падают И на базе `59f28d3b`:
-средозависимы — нужен интерфейс «Ethernet»; на хосте его нет; к REC-02 не
-относится, проверено stash-прогоном базы).
+средозависимы — нужен интерфейс «Ethernet»; к REC-02 не относится).
+`-race` недоступен на хосте (нет gcc/CGO) — как в предыдущих раундах.
 
-## 4. SCM smoke (VM `PC130-Evidence`, 2026-09-18)
+## 4. VM-проверки (гость `PC130-Evidence`, 2026-09-18)
 
-Бинарь `ThroneCore.exe` собран на хосте из `3f63ef7c`
-(prod-теги build_go.sh, CGO_ENABLED=0; sha256
-`17e9020bbae489f309ed8766899661be30ccdf9c0e81cf84f604854f88118556`),
-подменён в установленную службу `ProxyCoreService` (LocalSystem, demand):
-подмена/восстановление подтверждены хэшами
-(`90897198…` → `17e9020b…` → `90897198…`).
+Бинарь собран на хосте из `3308aa8b` (prod-теги build_go.sh,
+CGO_ENABLED=0; sha256 `64ef4c9161f303126ec5dd8329b785a43e364d59929d96686a
+69d5bd0f0c9911`), подменён в установленную службу `ProxyCoreService`
+(LocalSystem, demand): хэш-цепочка `90897198…` → `763d016d…` (промежуточная
+сборка) → `64ef4c91…` → `90897198…` (восстановление подтверждено). Логи
+службы — через `THRONE_SERVICE_LOG` (reg Environment), env восстановлен
+исходным. Клиент pipe — утилита smokeclient (вне репо; Hello/Start/Health
+по PC-110 envelope).
 
-Actual elapsed (net start / net stop, 3 цикла):
+### 4.1 Обычный SCM smoke (финальный бинарь), 3 цикла net start/net stop
 
-| Цикл | start | stop | Состояния |
-|---|---|---|---|
-| 1 (cold) | 7438 ms | 2553 ms | RUNNING → STOPPED |
-| 2 | 2077 ms | 2540 ms | RUNNING → STOPPED |
-| 3 | 2095 ms | 2531 ms | RUNNING → STOPPED |
+| Цикл | start | stop | PID службы | После stop |
+|---|---|---|---|---|
+| 1 (cold) | 2131 ms | 2531 ms | 2484 | STOPPED, 0/0, процесса нет |
+| 2 | 2094 ms | 2537 ms | 8572 | STOPPED, 0/0, процесса нет |
+| 3 | 2089 ms | ~2534 ms | 3556 | STOPPED, 0/0, процесса нет |
 
-Stop стабильно ограничен (~2.5s = 2s бюджет закрытия + SCM/cmd накладные),
-без зависаний. Артефакты: `vm-evidence/recovery/rec02/`
-(`rec02-steps.txt`, `REPORT.md`), бинарь
-`vm-evidence/recovery/rec01/artifacts/rec02/ThroneCore.exe`.
+PID в каждом цикле новый (2484→8572→3556) — старый процесс завершается
+всегда. Stop ~2.5s = 2s бюджет закрытия + SCM/cmd накладные.
+
+### 4.2 Fault A — SCM stop с АКТИВНЫМ runtime
+
+Старт службы (PID 6440) → smokeclient Start (реальный mixed-инбаунд на
+127.0.0.1:17890) → `netstat`: порт 17890 LISTENING у PID **6440** (внутри
+процесса службы) → `net stop`: 2545 ms → STOPPED 0/0; PID 6440 больше нет
+(«service process exit proven»); порт 17890 освобождён («no listener
+remains»). Лог службы: `[Info] sing-box closed in 0 ms` — путь
+ограниченного закрытия подтверждён журналом, чистый код 0 подтверждает
+cleanup. (Промежуточный прогон на сборке `763d016d`: close 55 ms, тот же
+итог.)
+
+### 4.3 Fault B — SCM stop во время СОЗДАНИЯ runtime (unconfirmed)
+
+Старт службы (PID 4256) → smokeclient `start-nowait` с конфигом
+~29.6 МБ (450k route-правил; frame < 32 МБ лимита) — создание в полёте →
+`net stop` через 3с: 5096 ms (bounded: 2s бюджет Stop + 2s ожидание
+хендлеров + накладные) → STOPPED, **WIN32_EXIT_CODE 1066
+(ERROR_SERVICE_SPECIFIC_ERROR), SERVICE_EXIT_CODE 2
+(svcExitStopUnconfirmed)**; PID 4256 исчез. Лог службы:
+`service stop: the runtime stop did not finish within 2s; cleanup is
+UNCONFIRMED - after Stopped this process exits, which destroys the
+in-process runtime`.
+
+Контраст с 4.1/4.2 (чистый стоп = 0/0) и журнальные строки
+«budget»-пути фиксируют: длительность/код остановки объяснены
+журналом, а не предположением. История вопроса: первый fault-прогон
+зафиксировал 0/0 при UNCONFIRMED-логе — дефект доставки exit code,
+исправлен в `3308aa8b` и перепроверен этим прогоном.
+
+Артефакты: `vm-evidence/recovery/rec02b/` — `logs/` (smoke-results.txt,
+fault-runtime.txt, fault-unconfirmed*.txt, state-before*.txt, restore*.txt,
+скриншоты консоли гостя), `artifacts/` (ThroneCore.exe, smokeclient.exe,
+конфиги), `guest/` (сценарии), `rec02b-run.sh`, `rec02b-type.sh`.
 
 ## 5. Тест выполнен / требование выполнено (разделение)
 
 | Пункт NEXT_TASKS | Тест выполнен | Требование выполнено |
 |---|---|---|
-| 1. Регрессия repeated Start | да (red/green, §3) | **да** |
-| 2. Разделение cleanup попытки и существующего runtime | да (тест: instance/mark сохраняются) | **да** (deferred cleanup только для своей попытки) |
-| 3. SCM Stop при реальном удержании lifecycleMu | да (реальный lock, не mock; red 10s/green 2s) | **да** |
-| 4. Bounded shutdown, один владелец, запрет поздней публикации, без ложного clean-stop | да (mark-отказ в тесте; `beginServiceRuntimeShutdown` один на run через stopOnce) | **да** (process fail-stop не понадобился — reason: F7-mark уже даёт no-survivor гарантию, bounded-ожидание на границе достаточно) |
-| 5. Start deadline/cancel; concurrent Start/Stop; repeated Stop; stalled Create; реальная ошибка startup; legacy child поведение; без второго runtime manager | частично: repeated Stop + startup-error — автотесты; stalled Create — через реальный hold lock (unit) и ограничение lock-wait/close (код); Start ctx/cancel в legacy Start НЕ передаётся в boxmain.Create (как и было) — не менялось, граница службы ограничивает по-другому (mark + bounded waits) | **да с задокументированным остатком**: legacy Start по-прежнему не отменяется по ctx (за пределами узкого diff; создание не публикуется до возврата, служебная граница ограничена) |
-| DoD: red-on-base, unit + SCM smoke, actual elapsed Stop, Windows runtime tests, отчёт | да (§3–4) | **да** |
+| R2/R3 (см. предыдущую редакцию §5) | да | **да** |
+| 1. Исход закрытия явный (completed/error/timeout); Stop не отвечает успехом при продолжающемся закрытии | да (boxbox-тесты, `TestStopReports*`) | **да** |
+| 2. Владение ресурсами закрывающегося runtime; блокировка нового runtime; повторный Stop видит незавершённое закрытие | да (teardown-record: Start-отказ, повторный Stop — в `TestStopReportsTimeoutWhenCloseHangs`) | **да** |
+| 3. SCM-граница: ErrorResp + Go error + timeout; аварийный путь; доказательство выхода процесса; не один F7-флаг | да (`TestServiceExecuteStopResultAtBoundary`, fault A/B на VM: PID исчезает, порт освобождён, SERVICE_EXIT_CODE 2) | **да** (no-survivor = выход процесса, доказан; F7-mark — только запрет запусков) |
+| 4. Уже начатый Start (прошёл admission/barrier, остановлен в создании, SCM-стоп упёрся в бюджет): возобновление создания, отсутствие поздней публикации и остатков | да (`TestServiceExecuteStartInsideCreationNoLatePublication`: создание реально публикует late runtime — premise проверена — и пост-чек сносит) | **да** (не заменяется отказом нового Start) |
+| 5. Регрессии: hung Close→timeout; Start при незавершённом Close; восстановление после Close; ошибка Stop не теряется на SCM-границе; Start не публикует после shutdown | да (§3) | **да** |
+| 6. SCM smoke + fault-сценарий с активным runtime; STOPPED + PID/ресурсы; «бюджет» подтверждён логами | да (§4.1–4.3) | **да** |
+| DoD: минимальный diff, регрессии, Windows-проверки, push | да | **да** |
 
-## 6. Остатки / не входит
+## 6. Исправления документа (REC-02B)
+
+Убрано неподтверждённое утверждение прежней редакции: «…поздний Start
+разворачивает собственный runtime и отказывает — публикация runtime после
+Stopped невозможна, Stopped не является ложным clean-stop (обязательное
+условие ревью). Process fail-stop не потребовался» и «reason: F7-mark уже
+даёт no-survivor гарантию». F7-mark блокирует ЗАПУСКИ — survivor-гарантию
+на границе даёт только выход процесса службы; теперь он явный (аварийный
+путь §2.3) и доказанный (§4.2–4.3). Также уточнено: bounded-ожидание
+закрытия не подтверждает teardown (§1, REC-02B).
+
+## 7. Остатки / не входит
 
 - Legacy Start не принимает ctx в boxmain.Create (структурно; обходится
   bounded-границей службы). Полная отмена создания — только вместе с
   переделкой создания (вне узкого diff REC-02).
-- Полный GUI-пакет из дерева `3f63ef7c` в CI не собирался (Go-часть
-  проверена юнитами + SCM smoke на хост-сборке бинаря; Setup .iss не менялся).
-- REC-03 (service envelope client + UI smoke) — следующая задача, зависимости
-  REC-01/02 закрыты.
+- Teardown-record не переживает аварийное завершение процесса — и не
+  должна: процесс уносит runtime с собой (§2.3). Внутрипроцессный
+  «переживший» close невозможен после выхода.
+- Полный GUI-пакет из дерева в CI не собирался (Go-часть проверена
+  юнитами + SCM smoke на хост-сборке бинаря; Setup .iss не менялся).
+- REC-03 (service envelope client + UI smoke) — следующая задача,
+  зависимости REC-01/02 закрыты.
