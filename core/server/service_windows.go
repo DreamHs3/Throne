@@ -225,6 +225,16 @@ func runServiceMode() error {
 	if !isSvc {
 		return errors.New("service mode requested outside the Windows SCM")
 	}
+	// REC-02B diagnostics: the SCM shows a service neither stdout nor stderr,
+	// so the stop-path evidence lines ("service stop: ...", the close-budget
+	// warnings) are invisible in a real service run. THRONE_SERVICE_LOG, when
+	// set (installer/evidence harness), appends the service's log output to
+	// that file. Unset in production default configuration.
+	if path := os.Getenv("THRONE_SERVICE_LOG"); path != "" {
+		if f, ferr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); ferr == nil {
+			log.SetOutput(f)
+		}
+	}
 	return svc.Run(proxyCoreServiceName, &proxyCoreServiceHandler{})
 }
 
