@@ -64,8 +64,9 @@ boxbox/api.go` (бюджет закрытия, явный исход). Runtime (
    возвращает `CloseCompleted` / `CloseFailed` / `CloseTimedOut` (с ошибкой
    close), плюс хук `onDone(error)`, который исполняется на горутине close
    ПОСЛЕ реального завершения — каким бы поздним оно ни было.
-2. **Владение teardown'ом** (`server.go`): Stop публикует экземпляр до
-   закрытия, а при `CloseTimedOut` регистрирует teardown-record:
+2. **Владение teardown'ом** (`server.go`): Stop снимает экземпляр с
+   публикации до закрытия (`setBoxInstance(nil, nil)`), а при
+   `CloseTimedOut` регистрирует teardown-record:
      - `Start` отказывает («teardown is still in progress») — второй
      runtime поверх закрывающегося не создаётся;
    - повторный Stop видит незавершённое закрытие: ждёт (bounded, 2с) и
@@ -107,7 +108,7 @@ boxbox/api.go` (бюджет закрытия, явный исход). Runtime (
 | `TestStopReportsTimeoutWhenCloseHangs` | — (швы новые) | PASS: зависший close → Stop сообщает timeout; Start при незавершённом закрытии отказан (второй runtime не создан); повторный Stop сообщает незавершённое закрытие; после завершения close record снят, Start и чистый Stop работают |
 | `TestStopReportsCloseErrorNotClean` | — | PASS: ошибка close всплывает в ответе Stop, без teardown-record |
 | `TestServiceExecuteStopResultAtBoundary` (4 кейса) | — | PASS: чистый Stop → код 0; Go error / ErrorResp / превышение бюджета → `svcExitStopUnconfirmed`, bounded |
-| `TestServiceExecuteStartInsideCreationNoLatePublication` | — | PASS: Start внутри создания держит lifecycleMu как реальное создание; SCM-стоп против удержания → UNCONFIRMED код; Stopped при всё ещё припаркованном Start; затем создание возобновляется, РЕАЛЬНО публикует runtime, post-check сносит: нет публикации после Stopped, нет record, нет Xray/extra process |
+| `TestServiceExecuteStartInsideCreationNoLatePublication` | — | PASS: Start внутри создания держит lifecycleMu как реальное создание; SCM-стоп против удержания → UNCONFIRMED код; Stopped при всё ещё припаркованном Start; затем создание возобновляется и РЕАЛЬНО публикует runtime уже ПОСЛЕ Stopped (краткая поздняя публикация — premise проверена), post-check сносит его: после сноса нет опубликованного runtime, нет record, нет Xray/extra process |
 | `TestServiceExecuteStopBoundedWithHeldLifecycleLock` (R2) | PASS 2.0s c кодом 0 — **ложный clean-stop при удержанном lock (red по существу REC-02B)** | PASS 2.0s c кодом `svcExitStopUnconfirmed` |
 | boxbox: `TestRunCloseBoundedReturnsPastDeadline` + 2 новых | — | PASS: (false,nil) по дедлайну; ошибка быстрого close — в ответе и хуке; позднее завершение — только через хук |
 | `TestDuplicateStartPreservesRunningRuntime` (R3) | PASS | PASS (не регрессировал) |
@@ -182,7 +183,34 @@ fault-runtime.txt, fault-unconfirmed*.txt, state-before*.txt, restore*.txt,
 | 1. Исход закрытия явный (completed/error/timeout); Stop не отвечает успехом при продолжающемся закрытии | да (boxbox-тесты, `TestStopReports*`) | **да** |
 | 2. Владение ресурсами закрывающегося runtime; блокировка нового runtime; повторный Stop видит незавершённое закрытие | да (teardown-record: Start-отказ, повторный Stop — в `TestStopReportsTimeoutWhenCloseHangs`) | **да** |
 | 3. SCM-граница: ErrorResp + Go error + timeout; аварийный путь; доказательство выхода процесса; не один F7-флаг | да (`TestServiceExecuteStopResultAtBoundary`, fault A/B на VM: PID исчезает, порт освобождён, SERVICE_EXIT_CODE 2) | **да** (no-survivor = выход процесса, доказан; F7-mark — только запрет запусков) |
-| 4. Уже начатый Start (прошёл admission/barrier, остановлен в создании, SCM-стоп упёрся в бюджет): возобновление создания, отсутствие поздней публикации и остатков | да (`TestServiceExecuteStartInsideCreationNoLatePublication`: создание реально публикует late runtime — premise проверена — и пост-чек сносит) | **да** (не заменяется отказом нового Start) |
+| 4. Уже начатый Start (прошёл admission/barrier, остановлен в создании, SCM-стоп упёрся в бюджет): возобновление создания; краткая публикация до post-check возможна — гарантируется последующее закрытие и отсутствие остатков (точная формулировка — под таблицей) | да (`TestServiceExecuteStartInsideCreationNoLatePublication`: создание реально публикует late runtime — premise проверена — и пост-чек сносит) | **да**, в точной формулировке: краткая поздняя публикация НЕ отсутствует — она закрывается post-check'ом; не заменяется отказом нового Start |
+
+### Точная формулировка гарантии (уточнение 2026-09-18)
+
+Уже выполняющийся Start, прошедший admission и барьер, допускает КРАТКУЮ
+публикацию: если SCM-стоп упёрся в бюджет, а создание возобновляется,
+runtime публикуется УЖЕ ПОСЛЕ Stopped — до срабатывания post-check.
+Поэтому гарантия НЕ является «отсутствием поздней публикации», и так её
+называть нельзя. Гарантия состоит в другом: post-check обнаруживает такой
+поздний runtime и закрывает его; после сноса не остаётся ни опубликованного
+runtime, ни teardown-record, ни Xray-инстансов, ни дополнительного процесса.
+Отказ нового Start (F7-mark) это не заменяет.
+
+Отдельно — что подтверждено проверками (юнит-тест + VM-прогон, каждый факт
+со своим источником):
+
+- **последующее закрытие** — юнит-тест
+  `TestServiceExecuteStartInsideCreationNoLatePublication`: возобновлённое
+  создание публикует runtime, post-check его сносит (`currentBox() == nil`,
+  teardown-record снят, Xray-инстансов и extra process нет, счётчик барьера
+  возвращён в 0);
+- **аварийный выход процесса** — ограниченный аварийный путь (§2.3),
+  подтверждён на VM (fault B, §4.3): после Stopped процесс службы
+  завершается и уносит внутрипроцессный runtime вместе с горутинами
+  teardown;
+- **отсутствие PID и ресурсов после выхода** — VM (§4.2–4.3): PID службы
+  исчезает, порт освобождён, `sc query` → STOPPED (0/0 в чистом цикле,
+  1066/2 в unconfirmed-сценарии).
 | 5. Регрессии: hung Close→timeout; Start при незавершённом Close; восстановление после Close; ошибка Stop не теряется на SCM-границе; Start не публикует после shutdown | да (§3) | **да** |
 | 6. SCM smoke + fault-сценарий с активным runtime; STOPPED + PID/ресурсы; «бюджет» подтверждён логами | да (§4.1–4.3) | **да** |
 | DoD: минимальный diff, регрессии, Windows-проверки, push | да | **да** |
@@ -197,6 +225,11 @@ Stopped невозможна, Stopped не является ложным clean-s
 на границе даёт только выход процесса службы; теперь он явный (аварийный
 путь §2.3) и доказанный (§4.2–4.3). Также уточнено: bounded-ожидание
 закрытия не подтверждает teardown (§1, REC-02B).
+
+Дополнено этой редакцией: формулировка гарантии для уже начатого Start
+уточнена — краткая публикация до post-check не называется «отсутствием
+поздней публикации» (§5, «Точная формулировка гарантии»); отдельно
+перечислено, что подтверждено проверками, с источником каждого факта.
 
 ## 7. Остатки / не входит
 
