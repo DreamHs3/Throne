@@ -75,8 +75,13 @@ const closeBudget = 2 * time.Second
 //   - makes a repeated Stop see the unfinished teardown instead of reporting
 //     a clean stop.
 //
-// The close goroutine clears it at the real completion (however late), via
-// the CloseWithTimeout onDone hook.
+// The record is registered BEFORE the bounded close starts (REC-02C): the
+// close goroutine clears it at the real completion (however late), via the
+// CloseWithTimeout onDone hook, so the hook's identity-checked clear always
+// reaches its own record. Registering only on a CloseTimedOut return raced
+// the hook - a close finishing right at the budget boundary runs the hook
+// while the bounded wait still returns CloseTimedOut, and the completed
+// record stayed registered past its close.
 type teardownRecord struct {
 	done chan struct{} // closed at the real close completion
 	err  error         // the close error, written before done closes
@@ -650,7 +655,11 @@ func (s *server) Stop(ctx context.Context, in *gen.EmptyReq) (out *gen.ErrorResp
 	// in the background; this stop stays its owner through the teardown
 	// record and reports a timeout - never success. The hook clears the
 	// record at the real completion, which also re-opens Start.
+	// REC-02C: the record is registered before the close starts, so the
+	// onDone hook's clear always lands on it - including the budget-boundary
+	// race where the hook has already run by the time CloseTimedOut returns.
 	rec := &teardownRecord{done: make(chan struct{})}
+	setTeardownRecord(rec)
 	outcome, closeErr := closePublishedRuntime(box, cancel, closeBudget, func(closeErr error) {
 		rec.err = closeErr
 		close(rec.done)
@@ -658,11 +667,19 @@ func (s *server) Stop(ctx context.Context, in *gen.EmptyReq) (out *gen.ErrorResp
 	})
 	switch outcome {
 	case boxbox.CloseTimedOut:
-		setTeardownRecord(rec)
+		// Never re-register here (REC-02C): the record is already registered,
+		// and re-registering against a hook that just ran would pin a COMPLETED
+		// close in place, locking Start until an extra Stop cleared it.
 		err = errors.New("stop timed out: the runtime close did not finish within 2s; the close continues in the background and stays owned by the stop path")
 		log.Println("stop incomplete: runtime close did not finish within 2s; it continues in the background (ownership retained until it finishes)")
 	case boxbox.CloseFailed:
+		// A finished close must not leave the record registered past this
+		// Stop: whichever of this clear and the hook's identity-checked clear
+		// runs first wins, the other is a no-op.
+		clearTeardownRecord(rec)
 		err = fmt.Errorf("runtime close failed: %v", closeErr)
+	case boxbox.CloseCompleted:
+		clearTeardownRecord(rec)
 	}
 
 	if extraProcess != nil {
