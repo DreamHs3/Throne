@@ -326,6 +326,25 @@ var serviceStartDelegate = func(ctx context.Context, in *gen.LoadConfigReq) (*ge
 	return globalServer.Start(ctx, in)
 }
 
+// serviceStopDelegate performs the runtime-stopping phase of the service stop
+// path (REC-02B). Production delegates to the legacy Stop; tests stub it to
+// stage unconfirmed cleanups deterministically — a Stop that reports an
+// error, or one that outlives the boundary budget.
+var serviceStopDelegate = func(ctx context.Context, in *gen.EmptyReq) (*gen.ErrorResp, error) {
+	return globalServer.Stop(ctx, in)
+}
+
+// Service exit codes recorded at the SCM boundary (the second return of
+// Execute). A bounded stop that cannot CONFIRM the runtime cleanup must never
+// be recorded as a successful stop: the abnormal exit code stays readable in
+// the SCM record (sc query: SERVICE_EXIT_CODE) so the failure is diagnosable
+// after the fact.
+const (
+	svcExitClean           = 0
+	svcExitListenFailed    = 1
+	svcExitStopUnconfirmed = 2
+)
+
 // serviceHandlerGate is the shutdown/admission barrier for one service run.
 // It closes handler admission synchronously at shutdown and makes a
 // WaitGroup.Add after the shutdown Wait has become possible impossible:
@@ -607,7 +626,7 @@ func (h *proxyCoreServiceHandler) Execute(args []string, r <-chan svc.ChangeRequ
 	if err != nil {
 		log.Printf("service pipe listen failed: %v", err)
 		status <- svc.Status{State: svc.Stopped}
-		return false, 1
+		return false, svcExitListenFailed
 	}
 
 	stopCh := make(chan struct{})
@@ -648,11 +667,29 @@ func (h *proxyCoreServiceHandler) Execute(args []string, r <-chan svc.ChangeRequ
 			//  5. stop the runtime (idempotent by upstream contract) —
 			//     ordered AFTER the mark; a Start that finishes past the
 			//     mark tears its own runtime down in its post-check and
-			//     refuses, so no runtime outlives Stopped except through
-			//     that bounded self-teardown;
+			//     refuses, so no runtime is PUBLISHED past Stopped except
+			//     through that bounded self-teardown (REC-02B: the mark
+			//     blocks starts — it is NOT itself the no-survivor
+			//     guarantee);
 			//  6. wait, bounded, for the handlers admitted before shutdown —
 			//     a handler that will not finish in time cannot hold SCM
-			//     hostage (the process exits right after Stopped anyway).
+			//     hostage.
+			//
+			// REC-02B: the runtime stop result is explicit at this boundary.
+			// Only a nil Go error AND an empty ErrorResp confirm the
+			// cleanup. A reported failure, or a stop that outlives the
+			// budget, is an UNCONFIRMED cleanup: it is logged under the
+			// "service stop:" prefix and recorded as the service-specific
+			// exit code svcExitStopUnconfirmed — never as a successful
+			// stop. The bounded emergency path for that case is the
+			// process exit itself: Execute returns Stopped, svc.Run
+			// returns, main() returns, and the process dies, destroying
+			// the in-process runtime (box, Xray instances) together with
+			// every goroutine still tearing it down. The no-survivor
+			// guarantee at this boundary is THAT exit (proven in the VM
+			// smoke by the disappearing service PID), with the F7 mark
+			// only refusing further starts.
+			stopExitCode := uint32(svcExitClean)
 			stopOnce.Do(func() {
 				handlersDone := h.admission.beginShutdown()
 				serveCtxCancel()
@@ -660,33 +697,46 @@ func (h *proxyCoreServiceHandler) Execute(args []string, r <-chan svc.ChangeRequ
 				_ = listener.Close()
 				conns.closeAll()
 				beginServiceRuntimeShutdown()
-				// Stop is idempotent by upstream contract (no instance → nil error).
+				type stopResult struct {
+					resp *gen.ErrorResp
+					err  error
+				}
 				// REC-02 R2: the runtime stop is bounded AT THIS BOUNDARY.
-				// A start parked inside boxmain.Create holds lifecycleMu for
-				// as long as the creation takes (and Stop itself bounds its
-				// lock wait and its close at 2s each), so the unguarded call
-				// could hold the stop path past any deadline. Correctness
-				// past the deadline comes from the shutdown mark (F7): a
-				// start that finishes later tears its own runtime down and
-				// refuses, so Stopped never leaves a published runtime
-				// behind and is never a false clean-stop.
-				stopDone := make(chan struct{})
+				// A start parked inside boxmain.Create holds lifecycleMu
+				// for as long as the creation takes (and Stop itself bounds
+				// its lock wait and its close at 2s each), so the call
+				// could hold the stop path past any deadline.
+				stopDone := make(chan stopResult, 1)
 				go func() {
-					_, _ = globalServer.Stop(context.Background(), &gen.EmptyReq{})
-					close(stopDone)
+					resp, err := serviceStopDelegate(context.Background(), &gen.EmptyReq{})
+					stopDone <- stopResult{resp: resp, err: err}
 				}()
+				stopConfirmed := false
 				select {
-				case <-stopDone:
+				case res := <-stopDone:
+					switch {
+					case res.err != nil:
+						log.Printf("service stop: runtime cleanup FAILED (go error): %v", res.err)
+					case res.resp == nil:
+						log.Println("service stop: runtime cleanup UNCONFIRMED: the stop path returned no result")
+					case res.resp.GetError() != "":
+						log.Printf("service stop: runtime cleanup FAILED: %s", res.resp.GetError())
+					default:
+						stopConfirmed = true
+					}
 				case <-time.After(2 * time.Second):
-					log.Println("service stop: the runtime stop did not finish within 2s; the shutdown mark owns the teardown")
+					log.Println("service stop: the runtime stop did not finish within 2s; cleanup is UNCONFIRMED - after Stopped this process exits, which destroys the in-process runtime")
 				}
 				select {
 				case <-handlersDone:
 				case <-time.After(2 * time.Second):
 				}
+				if !stopConfirmed {
+					stopExitCode = svcExitStopUnconfirmed
+				}
 			})
 			status <- svc.Status{State: svc.Stopped}
-			return false, 0
+			return false, stopExitCode
 		default:
 			log.Printf("unexpected service control request #%d", c)
 		}
@@ -1162,7 +1212,13 @@ func (s *server) ServiceStart(ctx context.Context, in *gen.LoadConfigReq) (*gen.
 	stopping := serviceRuntimeStopping
 	serviceRuntimeMu.Unlock()
 	if stopping {
-		_, _ = globalServer.Stop(context.Background(), &gen.EmptyReq{})
+		// REC-02B: the self-teardown result is not discarded silently — an
+		// unconfirmed teardown here is logged for the same "service stop:"
+		// diagnostics as the boundary path (the process exit remains the
+		// no-survivor backstop).
+		if resp, stopErr := globalServer.Stop(context.Background(), &gen.EmptyReq{}); stopErr != nil || resp.GetError() != "" {
+			log.Printf("service stop: the post-shutdown self-teardown of an in-flight start did not confirm: resp=%q err=%v", resp.GetError(), stopErr)
+		}
 		return nil, fmt.Errorf("%w: start refused", errServiceStopping)
 	}
 	return out, startErr

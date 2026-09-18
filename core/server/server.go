@@ -63,6 +63,58 @@ var debug bool
 
 var errInstanceNotRunning = errors.New("Instance is not running")
 
+// closeBudget bounds the runtime close wait in Stop (REC-02 R2).
+const closeBudget = 2 * time.Second
+
+// teardownRecord owns a runtime close that outlived the bounded wait
+// (REC-02B). Unpublishing the instance (setBoxInstance(nil, nil)) alone is
+// not enough: the closing runtime still holds its resources, so until the
+// background close finishes the record
+//   - makes Start refuse instead of building a second runtime on top of the
+//     closing one, and
+//   - makes a repeated Stop see the unfinished teardown instead of reporting
+//     a clean stop.
+//
+// The close goroutine clears it at the real completion (however late), via
+// the CloseWithTimeout onDone hook.
+type teardownRecord struct {
+	done chan struct{} // closed at the real close completion
+	err  error         // the close error, written before done closes
+}
+
+var (
+	teardownMu     sync.Mutex
+	teardownActive *teardownRecord
+)
+
+func setTeardownRecord(rec *teardownRecord) {
+	teardownMu.Lock()
+	teardownActive = rec
+	teardownMu.Unlock()
+}
+
+func pendingTeardown() *teardownRecord {
+	teardownMu.Lock()
+	defer teardownMu.Unlock()
+	return teardownActive
+}
+
+// clearTeardownRecord drops the record only if it is still the registered
+// one, so a late completion cannot erase a record it does not own.
+func clearTeardownRecord(rec *teardownRecord) {
+	teardownMu.Lock()
+	if teardownActive == rec {
+		teardownActive = nil
+	}
+	teardownMu.Unlock()
+}
+
+// closePublishedRuntime is the bounded close of the published runtime with a
+// completion hook (nil allowed); a var so tests can stage a hanging close.
+var closePublishedRuntime = func(box *boxbox.Box, cancel context.CancelFunc, d time.Duration, onDone func(error)) (boxbox.CloseOutcome, error) {
+	return box.CloseWithTimeout(cancel, d, log.Println, onDone)
+}
+
 func currentBox() *boxbox.Box {
 	stateMu.RLock()
 	defer stateMu.RUnlock()
@@ -343,7 +395,7 @@ func prepareTestEnv(current bool, needXray bool, xrayConfig string, xrayFullConf
 		return nil, err
 	}
 	cleanups = append(cleanups, func() {
-		box.CloseWithTimeout(cancel, 2*time.Second, log.Println)
+		box.CloseWithTimeout(cancel, 2*time.Second, log.Println, nil)
 	})
 
 	outTags := tags
@@ -383,6 +435,13 @@ func (s *server) Start(ctx context.Context, in *gen.LoadConfigReq) (out *gen.Err
 	// running while the next Stop sees nil and Health lies.
 	if currentBox() != nil {
 		return &gen.ErrorResp{Error: To("instance already started")}, nil
+	}
+	// REC-02B: with no published instance a previous close may still be
+	// running in the background. Building a second runtime on top of the
+	// closing one would race it for ports and resources: refuse until the
+	// teardown record clears at the real close completion.
+	if rec := pendingTeardown(); rec != nil {
+		return &gen.ErrorResp{Error: To("start refused: the previous runtime teardown is still in progress")}, nil
 	}
 
 	var err error
@@ -491,7 +550,7 @@ func (s *server) Start(ctx context.Context, in *gen.LoadConfigReq) (out *gen.Err
 
 	if runtime.GOOS == "darwin" && in.GetTunIpv4Cidr() != "" {
 		stopAllCores := func() {
-			box.CloseWithTimeout(cancel, time.Second*2, log.Println)
+			box.CloseWithTimeout(cancel, time.Second*2, log.Println, nil)
 			setBoxInstance(nil, nil)
 			if extraProcess != nil {
 				extraProcess.Stop()
@@ -526,16 +585,11 @@ func (s *server) Start(ctx context.Context, in *gen.LoadConfigReq) (out *gen.Err
 }
 
 func (s *server) Stop(ctx context.Context, in *gen.EmptyReq) (out *gen.ErrorResp, _ error) {
-	// REC-02 R2: a Start parked inside boxmain.Create holds the lock for as
-	// long as the creation takes. The stop path gives up after the deadline
-	// instead of blocking forever and reports an error - never a clean stop.
-	// The service stop path pairs this with the F7 shutdown mark, so a Start
-	// that outlives it tears its own runtime down and refuses.
 	// REC-02 R2: bounded acquisition - a Start parked inside boxmain.Create
 	// holds the lock for as long as the creation takes. Give up after the
-	// deadline and report an error - never a clean stop. The service stop
-	// path pairs this with the F7 shutdown mark, so a Start that outlives it
-	// tears its own runtime down and refuses.
+	// deadline and report an error - never a clean stop. REC-02B: the close
+	// result below is explicit; the service stop boundary consumes it and
+	// records an unconfirmed cleanup instead of a successful stop.
 	stopLockDeadline := time.Now().Add(2 * time.Second)
 	for {
 		if lifecycleMu.TryLock() {
@@ -557,6 +611,27 @@ func (s *server) Stop(ctx context.Context, in *gen.EmptyReq) (out *gen.ErrorResp
 		}
 	}()
 
+	// REC-02B: a previous Stop gave up waiting on the runtime close. That
+	// stop did not succeed, and until the background close finishes this one
+	// must not report a clean stop either: wait, bounded, for the in-flight
+	// close and surface its real result.
+	if rec := pendingTeardown(); rec != nil {
+		select {
+		case <-rec.done:
+			clearTeardownRecord(rec)
+			if rec.err != nil {
+				err = fmt.Errorf("previous stop unfinished: the runtime close failed: %v", rec.err)
+				return
+			}
+			// The background close finished cleanly: the instance was already
+			// unpublished and the side resources released by that stop.
+			return
+		case <-time.After(closeBudget):
+			err = errors.New("stop incomplete: the previous runtime close is still running")
+			return
+		}
+	}
+
 	box, cancel := currentInstance()
 	if box == nil {
 		return
@@ -571,7 +646,24 @@ func (s *server) Stop(ctx context.Context, in *gen.EmptyReq) (out *gen.ErrorResp
 	}
 	// Unpublished first, so a poll mid-teardown sees no instance rather than a dying one.
 	setBoxInstance(nil, nil)
-	box.CloseWithTimeout(cancel, time.Second*2, log.Println)
+	// REC-02B: the close result is explicit. A timed-out close keeps running
+	// in the background; this stop stays its owner through the teardown
+	// record and reports a timeout - never success. The hook clears the
+	// record at the real completion, which also re-opens Start.
+	rec := &teardownRecord{done: make(chan struct{})}
+	outcome, closeErr := closePublishedRuntime(box, cancel, closeBudget, func(closeErr error) {
+		rec.err = closeErr
+		close(rec.done)
+		clearTeardownRecord(rec)
+	})
+	switch outcome {
+	case boxbox.CloseTimedOut:
+		setTeardownRecord(rec)
+		err = errors.New("stop timed out: the runtime close did not finish within 2s; the close continues in the background and stays owned by the stop path")
+		log.Println("stop incomplete: runtime close did not finish within 2s; it continues in the background (ownership retained until it finishes)")
+	case boxbox.CloseFailed:
+		err = fmt.Errorf("runtime close failed: %v", closeErr)
+	}
 
 	if extraProcess != nil {
 		extraProcess.Stop()

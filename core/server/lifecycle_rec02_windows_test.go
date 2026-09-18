@@ -76,9 +76,14 @@ func TestDuplicateStartPreservesRunningRuntime(t *testing.T) {
 
 // REC-02 R2: the stop path with a REAL blocking hold on the lifecycle lock
 // (a Start parked inside boxmain.Create) must still reach Stopped, bounded.
-// The review rejected the naive "Stop in a goroutine + ACK": this test pairs
-// the bound with the F7 shutdown mark - after Execute returns, the mark must
-// be raised so a late Start is refused and no runtime is published.
+// REC-02B: because the runtime stop cannot run (the lock hold starves its
+// bounded lock wait), the cleanup stays UNCONFIRMED — Execute must record
+// that as the service-specific exit code svcExitStopUnconfirmed, never as a
+// successful stop, and log the emergency path (the process exit after
+// Stopped destroys the in-process runtime). The review rejected the naive
+// "Stop in a goroutine + ACK": the test also pairs the bound with the F7
+// shutdown mark - after Execute returns, the mark must be raised so a late
+// Start is refused and no runtime is published.
 func TestServiceExecuteStopBoundedWithHeldLifecycleLock(t *testing.T) {
 	t.Setenv("THRONE_SERVICE_PIPE", `\\.\pipe\ProxyCoreServiceTest-StopHeldLock`)
 	selfSID, _ := currentProcessIdentity(t)
@@ -124,8 +129,11 @@ func TestServiceExecuteStopBoundedWithHeldLifecycleLock(t *testing.T) {
 		if fire {
 			t.Fatal("a normal SCM stop must not request service death")
 		}
-		if code := <-exitCode; code != 0 {
-			t.Fatalf("normal stop exit code = %d, want 0", code)
+		// REC-02B: the stop could not run under the held lock, so the
+		// cleanup is unconfirmed — the exit code must record an abnormal
+		// stop, not a clean one.
+		if code := <-exitCode; code != svcExitStopUnconfirmed {
+			t.Fatalf("an unconfirmed stop exit code = %d, want %d (a bounded but unconfirmed stop must not be recorded as clean, REC-02B)", code, svcExitStopUnconfirmed)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Execute did not return after a Stop request while the lifecycle lock was held (unbounded stop, REC-02 R2)")
