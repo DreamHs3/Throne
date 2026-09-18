@@ -125,10 +125,7 @@ func TestServiceExecuteStopBoundedWithHeldLifecycleLock(t *testing.T) {
 
 	requests <- svc.ChangeRequest{Cmd: svc.Stop}
 	select {
-	case fire := <-exited:
-		if fire {
-			t.Fatal("a normal SCM stop must not request service death")
-		}
+	case <-exited:
 		// REC-02B: the stop could not run under the held lock, so the
 		// cleanup is unconfirmed — the exit code must record an abnormal
 		// stop, not a clean one.

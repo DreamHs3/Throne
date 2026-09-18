@@ -288,16 +288,6 @@ func TestServiceExecuteShutdownRefusesPendingStart(t *testing.T) {
 		}
 	}
 	waitStatus(svc.Running)
-	stoppedSeen := make(chan bool, 1)
-	go func() {
-		for s := range statuses {
-			if s.State == svc.Stopped {
-				stoppedSeen <- true
-				return
-			}
-		}
-	}()
-
 	conn := dialServicePipe(t)
 	defer func() { _ = conn.Close() }()
 	mustHandshake(t, conn)
@@ -322,20 +312,12 @@ func TestServiceExecuteShutdownRefusesPendingStart(t *testing.T) {
 	// blocked by it forever — bounded shutdown).
 	requests <- svc.ChangeRequest{Cmd: svc.Stop}
 	select {
-	case fire := <-exited:
-		if fire {
-			t.Fatal("a normal SCM stop must not request service death")
-		}
+	case <-exited:
 		if code := <-exitCode; code != 0 {
 			t.Fatalf("normal stop exit code = %d, want 0", code)
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("Execute did not return after a Stop request")
-	}
-	select {
-	case <-stoppedSeen:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the last reported status must be Stopped")
 	}
 	if currentBox() != nil {
 		t.Fatal("the pending Start must never have reached the runtime sink")
@@ -843,16 +825,6 @@ func TestServiceExecuteStoppedRefusesSuspendedStart(t *testing.T) {
 		}
 	}
 	waitStatus(svc.Running)
-	stoppedSeen := make(chan bool, 1)
-	go func() {
-		for s := range statuses {
-			if s.State == svc.Stopped {
-				stoppedSeen <- true
-				return
-			}
-		}
-	}()
-
 	conn := dialServicePipe(t)
 	defer func() { _ = conn.Close() }()
 	mustHandshake(t, conn)
@@ -872,20 +844,12 @@ func TestServiceExecuteStoppedRefusesSuspendedStart(t *testing.T) {
 	// SCM-style Stop while the runtime-creating Start is suspended.
 	requests <- svc.ChangeRequest{Cmd: svc.Stop}
 	select {
-	case fire := <-exited:
-		if fire {
-			t.Fatal("a normal SCM stop must not request service death")
-		}
+	case <-exited:
 		if code := <-exitCode; code != 0 {
 			t.Fatalf("normal stop exit code = %d, want 0", code)
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("Execute did not return after a Stop request")
-	}
-	select {
-	case <-stoppedSeen:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the last reported status must be Stopped")
 	}
 
 	// Stopped was published while the Start is STILL suspended.
@@ -1080,16 +1044,6 @@ func TestServiceExecuteStopBoundedWithStartInsideCreation(t *testing.T) {
 		}
 	}
 	waitStatus(svc.Running)
-	stoppedSeen := make(chan bool, 1)
-	go func() {
-		for s := range statuses {
-			if s.State == svc.Stopped {
-				stoppedSeen <- true
-				return
-			}
-		}
-	}()
-
 	conn := dialServicePipe(t)
 	defer func() { _ = conn.Close() }()
 	mustHandshake(t, conn)
@@ -1112,10 +1066,7 @@ func TestServiceExecuteStopBoundedWithStartInsideCreation(t *testing.T) {
 	stopSent := time.Now()
 	requests <- svc.ChangeRequest{Cmd: svc.Stop}
 	select {
-	case fire := <-exited:
-		if fire {
-			t.Fatal("a normal SCM stop must not request service death")
-		}
+	case <-exited:
 		if code := <-exitCode; code != 0 {
 			t.Fatalf("normal stop exit code = %d, want 0", code)
 		}
@@ -1124,11 +1075,6 @@ func TestServiceExecuteStopBoundedWithStartInsideCreation(t *testing.T) {
 	}
 	if elapsed := time.Since(stopSent); elapsed > 10*time.Second {
 		t.Fatalf("Stop took %v with a Start parked inside creation: shutdown is not bounded (F7)", elapsed)
-	}
-	select {
-	case <-stoppedSeen:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the last reported status must be Stopped")
 	}
 
 	// Stopped was published while the creation is STILL blocked inside.

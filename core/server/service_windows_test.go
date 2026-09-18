@@ -777,7 +777,9 @@ func TestServiceHandlerExecuteLifecycleWithoutSCM(t *testing.T) {
 		defer close(drainDone)
 		for s := range statuses {
 			got = append(got, s)
-			if s.State == svc.Stopped {
+			// REC-02B: StopPending is the last status Execute reports; the
+			// svc runtime sends SERVICE_STOPPED itself after Execute returns.
+			if s.State == svc.StopPending {
 				return
 			}
 		}
@@ -787,10 +789,7 @@ func TestServiceHandlerExecuteLifecycleWithoutSCM(t *testing.T) {
 	requests <- svc.ChangeRequest{Cmd: svc.Stop}
 
 	select {
-	case fire := <-exited:
-		if fire {
-			t.Fatal("a normal SCM stop must not request service death")
-		}
+	case <-exited:
 		if code := <-exitCode; code != 0 {
 			t.Fatalf("normal stop exit code = %d, want 0", code)
 		}
@@ -799,6 +798,11 @@ func TestServiceHandlerExecuteLifecycleWithoutSCM(t *testing.T) {
 	}
 	<-drainDone
 
+	// REC-02B: Execute no longer sends Stopped on the status channel — the
+	// svc runtime reports SERVICE_STOPPED itself after Execute returns and
+	// attaches the returned exit code to that final update. The reported
+	// sequence therefore ends with StopPending, and Execute returning is the
+	// stopped point.
 	var states []svc.State
 	for _, s := range got {
 		states = append(states, s.State)
@@ -806,8 +810,8 @@ func TestServiceHandlerExecuteLifecycleWithoutSCM(t *testing.T) {
 	if len(states) == 0 || states[0] != svc.StartPending {
 		t.Fatalf("first status must be StartPending, got %v", states)
 	}
-	if states[len(states)-1] != svc.Stopped {
-		t.Fatalf("last status must be Stopped, got %v", states)
+	if states[len(states)-1] != svc.StopPending {
+		t.Fatalf("last status must be StopPending, got %v", states)
 	}
 	if currentBox() != nil {
 		t.Fatal("service shutdown must leave no runtime running")

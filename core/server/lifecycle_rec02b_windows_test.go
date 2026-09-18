@@ -254,29 +254,16 @@ func startExecute(t *testing.T, name string) *executeHarness {
 	}
 }
 
-func (h *executeHarness) waitStopped(t *testing.T) {
-	t.Helper()
-	deadline := time.After(5 * time.Second)
-	for {
-		select {
-		case s := <-h.statuses:
-			if s.State == svc.Stopped {
-				return
-			}
-		case <-deadline:
-			t.Fatal("the last reported status must be Stopped")
-		}
-	}
-}
-
 func (h *executeHarness) stop(t *testing.T, wantClean bool, maxWait time.Duration) {
 	t.Helper()
 	h.requests <- svc.ChangeRequest{Cmd: svc.Stop}
+	// REC-02B: Execute no longer sends Stopped on the status channel (that
+	// send finalized the SCM record with default exit codes before the
+	// returned exit code could be attached — proven in the VM evidence).
+	// The svc runtime reports SERVICE_STOPPED itself after Execute returns,
+	// so the return (captured below) IS the stopped point of the harness.
 	select {
-	case fire := <-h.exited:
-		if fire {
-			t.Fatal("a normal SCM stop must not request service death")
-		}
+	case <-h.exited:
 		code := <-h.exitCode
 		if wantClean && code != svcExitClean {
 			t.Fatalf("a confirmed clean stop exit code = %d, want %d", code, svcExitClean)
@@ -287,7 +274,6 @@ func (h *executeHarness) stop(t *testing.T, wantClean bool, maxWait time.Duratio
 	case <-time.After(maxWait):
 		t.Fatal("Execute did not return after a Stop request")
 	}
-	h.waitStopped(t)
 }
 
 // The SCM boundary consumes the stop result explicitly: a nil Go error AND an
@@ -412,10 +398,7 @@ func TestServiceExecuteStartInsideCreationNoLatePublication(t *testing.T) {
 	started := time.Now()
 	h.requests <- svc.ChangeRequest{Cmd: svc.Stop}
 	select {
-	case fire := <-h.exited:
-		if fire {
-			t.Fatal("a normal SCM stop must not request service death")
-		}
+	case <-h.exited:
 		if code := <-h.exitCode; code != svcExitStopUnconfirmed {
 			t.Fatalf("exit code = %d, want %d (a stop that could not run must not be recorded as clean, REC-02B)", code, svcExitStopUnconfirmed)
 		}
@@ -425,9 +408,10 @@ func TestServiceExecuteStartInsideCreationNoLatePublication(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > 12*time.Second {
 		t.Fatalf("Stop took %v with a Start parked inside creation: shutdown is not bounded", elapsed)
 	}
-	h.waitStopped(t)
+	// Execute returned: the svc runtime reports SERVICE_STOPPED at this point
+	// (REC-02B: no explicit Stopped send from Execute).
 
-	// Stopped was published while the creation is STILL parked inside.
+	// The stop completed while the creation is STILL parked inside.
 	if h.handler.admission.inflight() != 1 {
 		t.Fatalf("the parked Start must still be in flight at Stopped, inflight = %d", h.handler.admission.inflight())
 	}

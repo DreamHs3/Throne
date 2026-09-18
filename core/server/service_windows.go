@@ -635,8 +635,12 @@ func (h *proxyCoreServiceHandler) Execute(args []string, r <-chan svc.ChangeRequ
 	listener, err := listenServicePipe()
 	if err != nil {
 		log.Printf("service pipe listen failed: %v", err)
-		status <- svc.Status{State: svc.Stopped}
-		return false, svcExitListenFailed
+		// Do NOT send Stopped on the status channel: the svc runtime reports
+		// SERVICE_STOPPED itself after Execute returns, and an explicit send
+		// finalizes the SCM record with default exit codes BEFORE the
+		// returned exit code can be attached (REC-02B VM evidence: the
+		// unconfirmed stop recorded 0/0 in sc query this way).
+		return true, svcExitListenFailed
 	}
 
 	stopCh := make(chan struct{})
@@ -745,8 +749,13 @@ func (h *proxyCoreServiceHandler) Execute(args []string, r <-chan svc.ChangeRequ
 					stopExitCode = svcExitStopUnconfirmed
 				}
 			})
-			status <- svc.Status{State: svc.Stopped}
-			return false, stopExitCode
+			// Do NOT send Stopped on the status channel (see the listen-fail
+			// path above): the svc runtime reports SERVICE_STOPPED itself
+			// after Execute returns and attaches the returned exit code to
+			// that final update. svcSpecificEC=true records stopExitCode as
+			// the service-specific exit code (sc query: SERVICE_EXIT_CODE),
+			// so an unconfirmed cleanup stays diagnosable after the fact.
+			return true, stopExitCode
 		default:
 			log.Printf("unexpected service control request #%d", c)
 		}
