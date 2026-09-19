@@ -203,6 +203,21 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), ui(new Ui::MainWi
 
     bool coreDebugMode = (Configs::dataManager->settingsRepo->log_level == "debug");
 
+    // REC-03 service-mode: the runtime lives inside ProxyCoreService; the GUI
+    // binds no child IPC server and spawns no child core. No silent fallback
+    // to the child path exists — a service problem is reported as such.
+    if (Configs::dataManager->settingsRepo->service_mode) {
+        MW_show_log(tr("Service mode: the core runs inside the ProxyCoreService; "
+                       "starting the child core is skipped."));
+
+        runOnThread(
+            [=, this] {
+                QMutexLocker lock(&coreProcessMutex);
+                core_process = nullptr;
+            },
+            DS_cores);
+        start_service_health_monitor();
+    } else {
     Configs::dataManager->settingsRepo->core_socket_name =
         // Per-run pipe name; the prefix marks the ProxyCore instance so a
         // simultaneously running Throne can never observe this pipe.
@@ -250,6 +265,23 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), ui(new Ui::MainWi
             core_process->Start();
         },
         DS_cores);
+    }
+
+    // The service-mode toggle (REC-03): applies on restart, since the child
+    // core is spawned at startup.
+    {
+        auto *actServiceMode = new QAction(tr("Run the core through the service"), this);
+        actServiceMode->setCheckable(true);
+        actServiceMode->setChecked(Configs::dataManager->settingsRepo->service_mode);
+        connect(actServiceMode, &QAction::toggled, this, [=, this](bool checked) {
+            if (checked == Configs::dataManager->settingsRepo->service_mode) return;
+            Configs::dataManager->settingsRepo->service_mode = checked;
+            Configs::dataManager->settingsRepo->Save();
+            MW_show_log(checked ? tr("Service mode enabled — takes effect after the program restarts.")
+                                : tr("Service mode disabled — takes effect after the program restarts."));
+        });
+        ui->menu_program->insertAction(ui->actionRestart_Proxy, actServiceMode);
+    }
 
     if (!Configs::dataManager->settingsRepo->font.isEmpty()) {
         auto font = qApp->font();

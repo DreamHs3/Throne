@@ -4,6 +4,7 @@
 #include <include/global/HTTPRequestHelper.hpp>
 #ifndef Q_MOC_RUN
 #include <core/server/gen/libcore.pb.h>
+#include "include/api/ServiceClient.h"
 #endif
 
 #include "include/global/Configs.hpp"
@@ -147,6 +148,22 @@ public:
 
     void RestartCore();
 
+    // REC-03 service-mode helpers: the core is driven through the
+    // ProxyCoreService pipe (API::defaultServiceClient) instead of a child
+    // core. All of them run off the UI thread except the *_tick reconciliation.
+    bool service_mode_active() const;
+    // Builds no child core, binds no child IPC server.
+    void start_service_health_monitor();
+    void service_health_tick(API::ServiceClient::Outcome outcome, bool runtimeRunning, const QString &message);
+    // CheckConfig -> Start through the service. Returns false when the start
+    // must stop here (transport/service problem already reported); sets
+    // *payloadError for the service's business error (empty = success).
+    bool service_check_config_then_start(const libcore::LoadConfigReq &req, QString *payloadError);
+    // Stop through the service; false when the stop did not confirm.
+    bool service_stop();
+    void service_report_operation_failure(const QString &what, const API::ServiceClient::Result &r);
+    void service_report_unknown(const QString &what, const API::ServiceClient::Result &r);
+
     // Whole poll snapshot in the lister's order, never a delta. UI thread only.
     void UpdateConnectionList(const QList<Stats::ConnectionMetadata>& connections);
 
@@ -257,6 +274,9 @@ private:
     QMutex coreProcessMutex;
     QLocalServer *core_server = nullptr;
     bool rpc_started = false;
+    // REC-03 service-mode state (see mainwindow_service_mode.cpp).
+    QTimer *m_serviceHealthTimer = nullptr;
+    int m_serviceLastHealthState = -1; // -1 unknown, 0 ok+idle, 1 ok+running, 2 unreachable, 3 denied, 4 broken
     qint64 vpn_pid = 0;
     QTextDocument *qvLogDocument = new QTextDocument(this);
     QString title_error;

@@ -135,7 +135,7 @@ void MainWindow::prepare_exit()
 
     runOnThread([=, this]()
     {
-        core_process->Kill();
+        if (core_process) core_process->Kill();
     }, DS_cores, true);
     HideWindow(this);
     tray->hide();
@@ -307,17 +307,28 @@ void MainWindow::set_spmode_vpn(bool enable, bool save) {
 bool MainWindow::StopVPNProcess() {
     runOnThread([=, this]
     {
-        core_process->Kill();
+        if (core_process) core_process->Kill();
     }, DS_cores, true);
 
     return true;
 }
 
 void MainWindow::RestartCore() {
+    // REC-03 service-mode: there is no child core to kill. "Restart proxy"
+    // means: stop the runtime through the service IPC, then start the same
+    // profile again. The Windows service itself is never touched.
+    if (Configs::dataManager->settingsRepo->service_mode) {
+        runOnNewThread([this] {
+            const auto id = Configs::dataManager->settingsRepo->started_id;
+            profile_stop(false, true, true);
+            if (id >= 0) profile_start(id);
+        });
+        return;
+    }
     runOnThread([=, this]
     {
         profile_stop(true, true, true);
-        core_process->Kill();
+        if (core_process) core_process->Kill();
     }, DS_cores);
 }
 

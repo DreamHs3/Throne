@@ -253,9 +253,18 @@ void MainWindow::profile_start(int _id) {
             req.extra_no_out = result->extraCoreData->noLog;
         }
         bool rpcOK;
-        const QString error = defaultClient->Start(&rpcOK, req);
-        if (!rpcOK) {
-            return false;
+        QString error;
+        if (Configs::dataManager->settingsRepo->service_mode) {
+            // REC-03: CheckConfig first, then Start — both through the
+            // service; failures are classified and reported explicitly.
+            if (!service_check_config_then_start(req, &error)) {
+                return false;
+            }
+        } else {
+            error = defaultClient->Start(&rpcOK, req);
+            if (!rpcOK) {
+                return false;
+            }
         }
         if (!error.isEmpty()) {
             if (handleXrayGeoAssetError(error, ent->outbound->DisplayTypeAndName())) {
@@ -369,7 +378,10 @@ void MainWindow::profile_start(int _id) {
     }
     mu_stopping.unlock();
 
-    if (!Configs::dataManager->settingsRepo->core_running) {
+    // In service-mode there is no child core to wait for: the service pipe is
+    // the only path (a service problem is reported, never a silent child
+    // restart).
+    if (!Configs::dataManager->settingsRepo->service_mode && !Configs::dataManager->settingsRepo->core_running) {
         runOnThread(
             [=, this] {
                 MW_show_log(tr("Try to start the config, but the core has not listened to the RPC port, so restart it..."));
@@ -419,19 +431,29 @@ void MainWindow::profile_stop(bool crash, bool block, bool manual) {
     const auto id = running->id;
 
     auto profile_stop_stage2 = [=,this] {
-        if (testRunner->isTestingCurrent()) {
+        // Profile tests run over the legacy child IPC and are unavailable in
+        // service-mode.
+        if (!Configs::dataManager->settingsRepo->service_mode && testRunner->isTestingCurrent()) {
             bool ok;
             defaultClient->StopTests(&ok);
             if (!ok) MW_show_log("Failed to stop profile tests!");
         }
         if (!crash) {
-            bool rpcOK;
-            const QString error = defaultClient->Stop(&rpcOK);
-            if (rpcOK && !error.isEmpty()) {
-                runOnUiThread([=,this] { MessageBoxWarning(tr("Stop return error"), error); });
-                return false;
-            } else if (!rpcOK) {
-                return false;
+            if (Configs::dataManager->settingsRepo->service_mode) {
+                // REC-03: stop through the service; an UNKNOWN outcome is
+                // resolved via Health and reported, never retried blindly.
+                if (!service_stop()) {
+                    return false;
+                }
+            } else {
+                bool rpcOK;
+                const QString error = defaultClient->Stop(&rpcOK);
+                if (rpcOK && !error.isEmpty()) {
+                    runOnUiThread([=,this] { MessageBoxWarning(tr("Stop return error"), error); });
+                    return false;
+                } else if (!rpcOK) {
+                    return false;
+                }
             }
         }
         if (Configs::dataManager->settingsRepo->spmode_system_proxy) set_system_proxy(false);

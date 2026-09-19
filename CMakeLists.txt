@@ -176,6 +176,7 @@ set(PROJECT_SOURCES
         src/ui/mainWindow/mainwindow_log.cpp
         src/ui/mainWindow/mainwindow_hotkeys.cpp
         src/ui/mainWindow/mainwindow_profile_lifecycle.cpp
+        src/ui/mainWindow/mainwindow_service_mode.cpp
         src/ui/mainWindow/mainwindow_autoselector.cpp
         src/ui/mainWindow/TestRunner.cpp
         include/ui/mainWindow/MainWindowInternal.h

@@ -54,6 +54,7 @@ namespace Configs {
             {"system_dns_set",                &system_dns_set},
             {"windows_set_admin",             &windows_set_admin},
             {"disable_win_admin",             &disable_run_admin},
+            {"service_mode",                  &service_mode},
             {"enable_stats",                  &enable_stats},
             {"disable_privilege_req",         &disable_privilege_req},
             {"enable_tun_routing",            &enable_tun_routing},

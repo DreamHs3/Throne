@@ -490,6 +490,9 @@ int main(int argc, char* argv[]) {
 #endif
 
     API::defaultClient = new API::Client();
+    // REC-03: the ProxyCoreService envelope client; used only when service
+    // mode is on, created unconditionally like defaultClient.
+    API::defaultServiceClient = new API::ServiceClient();
 
     UI_InitMainWindow();
 

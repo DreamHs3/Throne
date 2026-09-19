@@ -159,6 +159,9 @@ namespace Configs {
         QString utlsFingerprint = "";
         bool disable_run_admin = false; // windows only
         bool use_mozilla_certs = false;
+        // REC-03: run the core inside ProxyCoreService through the service
+        // pipe instead of spawning a child core. Takes effect after restart.
+        bool service_mode = false;
 
         // Remember
         bool remember_system_proxy = false;
