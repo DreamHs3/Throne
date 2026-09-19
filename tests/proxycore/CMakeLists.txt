@@ -110,6 +110,34 @@ function(add_characterization_harness target main_cpp)
 endfunction()
 add_characterization_harness(proxycore_characterization test_route_characterization.cpp)
 add_characterization_harness(proxycore_parser_fixtures test_parser_fixtures.cpp)
+
+# --- REC-03: service pipe client (QtCore/QtNetwork + generated envelopes) ---
+# Links ONLY the client (no UI, no app-core): the fake pipe server inside the
+# test speaks the same PC-110 envelope protocol via the generated bindings.
+# Must run WITHOUT the real ProxyCoreService running: the harness binds the
+# fixed production pipe name.
+add_executable(proxycore_service_client
+        test_service_client.cpp
+        ${CMAKE_SOURCE_DIR}/src/api/ServiceClient.cpp
+        ${CMAKE_SOURCE_DIR}/include/api/ServiceClient.h
+)
+set_property(TARGET proxycore_service_client PROPERTY AUTOMOC ON)
+target_include_directories(proxycore_service_client PRIVATE
+        ${CMAKE_SOURCE_DIR}
+)
+target_link_libraries(proxycore_service_client PRIVATE
+        Qt6::Network
+        myproto
+)
+if (WIN32)
+    target_compile_definitions(proxycore_service_client PRIVATE UNICODE _UNICODE NOMINMAX _WIN32_WINNT=0x600)
+    if (MSVC)
+        target_compile_options(proxycore_service_client PRIVATE "/utf-8")
+    endif ()
+endif ()
+add_test(NAME proxycore_service_client
+         COMMAND proxycore_service_client
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_test(NAME proxycore_no_updater_guard
          COMMAND ${CMAKE_COMMAND} -E env bash tests/proxycore/check_no_updater.sh
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

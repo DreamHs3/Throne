@@ -277,8 +277,13 @@ jobs:
           mkdir build
           cd build
           curl -fLso srslist.h "https://raw.githubusercontent.com/throneproj/routeprofiles/rule-set/srslist.h"
-          cmake -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo $LAUNCHER_ARGS ..
+          # REC-03: the windows-amd64 build also compiles the proxycore test
+          # harnesses (incl. the service pipe client suite) and runs ctest.
+          TEST_FLAG=OFF
+          if [[ "${{ matrix.dest_suffix }}" == "windows-amd64" ]]; then TEST_FLAG=ON; fi
+          cmake -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DPROXYCORE_BUILD_TESTS=$TEST_FLAG $LAUNCHER_ARGS ..
           ninja
+          if [[ "$TEST_FLAG" == "ON" ]]; then ctest --output-on-failure; fi
           cd ..
           ./script/deploy_windows.sh
       - name: Linux - Generate MakeFile and Build

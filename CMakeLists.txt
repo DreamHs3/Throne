@@ -132,6 +132,8 @@ set(PROJECT_SOURCES
         3rdparty/SQLiteCpp/src/Transaction.cpp
 
         src/api/RPC.cpp
+        include/api/ServiceClient.h
+        src/api/ServiceClient.cpp
 
         src/stats/traffic/TrafficLooper.cpp
         include/stats/traffic/TrafficStatsManager.hpp
