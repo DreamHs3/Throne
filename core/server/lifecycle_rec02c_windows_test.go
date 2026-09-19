@@ -37,27 +37,33 @@ func TestStopWithCompletedCloseTimedOutLeavesNoRecord(t *testing.T) {
 	if _, err := globalServer.Start(context.Background(), req); err != nil {
 		t.Fatalf("first start: %v", err)
 	}
-	if currentBox() == nil {
-		t.Fatal("the first start did not publish the runtime")
-	}
 
-	// The stub skips the real close (like the failed-close stub in REC-02B):
-	// the completion callback runs inline, then the bounded wait reports the
-	// timeout — exactly the budget-boundary interleaving.
-	var closedBox *boxbox.Box
-	var closedCancel context.CancelFunc
+	// Everything the test created is freed here — including on an early
+	// t.Fatal: the captured first runtime is really closed if the modeled
+	// Stop never got to it, whatever instance is still published is
+	// stopped, and the standard close function is restored. (Cleanup runs
+	// strictly after the test body, so a plain flag cannot race.)
+	var capturedBox *boxbox.Box
+	var capturedCancel context.CancelFunc
+	capturedClosed := false
 	prevClose := closePublishedRuntime
+	modelingStop := false
 	closePublishedRuntime = func(box *boxbox.Box, cancel context.CancelFunc, d time.Duration, onDone func(error)) (boxbox.CloseOutcome, error) {
-		closedBox, closedCancel = box, cancel
+		// The stub serves ONLY the modeled Stop; any other close (a later
+		// Start/Stop that races a failure, the cleanup's own Stop) goes
+		// through the real bounded close.
+		if !modelingStop {
+			return prevClose(box, cancel, d, onDone)
+		}
+		capturedBox, capturedCancel = box, cancel
 		onDone(nil)
 		return boxbox.CloseTimedOut, nil
 	}
 	t.Cleanup(func() {
+		modelingStop = false
 		closePublishedRuntime = prevClose
-		// The stub skipped the real close: close the captured runtime for
-		// real, then stop whatever instance the test left published.
-		if closedBox != nil {
-			_, _ = closedBox.CloseWithTimeout(closedCancel, 2*time.Second, log.Println, nil)
+		if capturedBox != nil && !capturedClosed {
+			_, _ = capturedBox.CloseWithTimeout(capturedCancel, 2*time.Second, log.Println, nil)
 		}
 		if currentBox() != nil {
 			_, _ = globalServer.Stop(context.Background(), &gen.EmptyReq{})
@@ -65,7 +71,17 @@ func TestStopWithCompletedCloseTimedOutLeavesNoRecord(t *testing.T) {
 		autoRedirectMark.Store(0)
 	})
 
+	if currentBox() == nil {
+		t.Fatal("the first start did not publish the runtime")
+	}
+
+	// The stub skips the real close (like the failed-close stub in REC-02B):
+	// the completion callback runs inline, then the bounded wait reports the
+	// timeout — exactly the budget-boundary interleaving.
+	modelingStop = true
 	resp, err := globalServer.Stop(context.Background(), &gen.EmptyReq{})
+	modelingStop = false
+	closePublishedRuntime = prevClose
 	if err != nil {
 		t.Fatalf("stop must report the outcome in the response, not as a transport error: %v", err)
 	}
@@ -80,6 +96,18 @@ func TestStopWithCompletedCloseTimedOutLeavesNoRecord(t *testing.T) {
 		t.Fatal("a close that already completed must not stay registered in the teardown record (REC-02C)")
 	}
 
+	// The stub skipped the first runtime's real close: close it FOR REAL,
+	// through the standard close function, before the next Start — the
+	// raced completion cleared the record, but the runtime itself must not
+	// leak into the rest of the test.
+	if capturedBox == nil {
+		t.Fatal("the modeled stop did not hand over the captured runtime")
+	}
+	capturedClosed = true
+	if outcome, closeErr := capturedBox.CloseWithTimeout(capturedCancel, 2*time.Second, log.Println, nil); outcome != boxbox.CloseCompleted {
+		t.Fatalf("the captured first runtime must close for real before the next start, got outcome %v (err %v)", outcome, closeErr)
+	}
+
 	// The point of the fix: the next Start needs no extra Stop to release
 	// the lock — the raced completion already cleared the record.
 	if _, err := globalServer.Start(context.Background(), req); err != nil {
@@ -88,10 +116,19 @@ func TestStopWithCompletedCloseTimedOutLeavesNoRecord(t *testing.T) {
 	if currentBox() == nil {
 		t.Fatal("no runtime after the post-race start")
 	}
-	if _, err := globalServer.Stop(context.Background(), &gen.EmptyReq{}); err != nil {
-		t.Fatalf("the stop after the post-race start must be clean, got %v", err)
+	// The final stop must be clean on BOTH channels: no transport error and
+	// no error inside the typed payload.
+	stopResp, stopErr := globalServer.Stop(context.Background(), &gen.EmptyReq{})
+	if stopErr != nil {
+		t.Fatalf("the final stop must not carry a Go error, got %v", stopErr)
+	}
+	if stopResp.GetError() != "" {
+		t.Fatalf("the final stop must not carry an ErrorResp error, got %q", stopResp.GetError())
 	}
 	if currentBox() != nil {
 		t.Fatal("runtime left after the clean stop")
+	}
+	if pendingTeardown() != nil {
+		t.Fatal("teardown record left after the clean stop")
 	}
 }
