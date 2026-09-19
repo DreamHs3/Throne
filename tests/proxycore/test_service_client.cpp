@@ -49,7 +49,8 @@
 #define CHECK(cond)                                                                       \
     do {                                                                                  \
         if (!(cond)) {                                                                    \
-            qWarning("CHECK failed at %s:%d: %s", __FILE__, __LINE__, #cond);             \
+            fprintf(stderr, "CHECK failed at %s:%d: %s\n", __FILE__, __LINE__, #cond);    \
+            fflush(stderr);                                                               \
             failures++;                                                                   \
         }                                                                                 \
     } while (false)
@@ -204,7 +205,14 @@ namespace {
                     }
                     c->handshaken = true;
                 }
-                handler(*c, env);
+                try {
+                    handler(*c, env);
+                } catch (...) {
+                    fprintf(stderr, "handler threw (server thread)
+");
+                    fflush(stderr);
+                    failures++;
+                }
             }
         }
 
@@ -291,7 +299,7 @@ namespace {
         API::ServiceClient client;
 
         // ---- T1: happy Hello + Health + CheckConfig + Start + Stop --------
-        {
+        try {
             auto stats = std::make_shared<Stats>();
             ServerThread svc(
                 [](ServerConn &c, const libcore::RequestEnvelope &env) {
@@ -331,9 +339,21 @@ namespace {
             CHECK(r.ok());
             assertEnvelopeDiscipline(stats);
         }
+        catch (const std::exception &e) {
+            fprintf(stderr, "case threw (near line %d): %s
+", __LINE__, e.what());
+            fflush(stderr);
+            failures++;
+        }
+        catch (...) {
+            fprintf(stderr, "case threw (unknown, near line %d)
+", __LINE__);
+            fflush(stderr);
+            failures++;
+        }
 
         // ---- T2: partial response delivery (framing) ----------------------
-        {
+        try {
             settle();
             auto stats = std::make_shared<Stats>();
             ServerThread svc(
@@ -353,9 +373,21 @@ namespace {
             CHECK(!health.runtimeRunning);
             assertEnvelopeDiscipline(stats);
         }
+        catch (const std::exception &e) {
+            fprintf(stderr, "case threw (near line %d): %s
+", __LINE__, e.what());
+            fflush(stderr);
+            failures++;
+        }
+        catch (...) {
+            fprintf(stderr, "case threw (unknown, near line %d)
+", __LINE__);
+            fflush(stderr);
+            failures++;
+        }
 
         // ---- T3: envelope code (stale policy revision) ---------------------
-        {
+        try {
             settle();
             auto stats = std::make_shared<Stats>();
             ServerThread svc(
@@ -375,9 +407,21 @@ namespace {
             CHECK(r.outcomeKnown());
             assertEnvelopeDiscipline(stats);
         }
+        catch (const std::exception &e) {
+            fprintf(stderr, "case threw (near line %d): %s
+", __LINE__, e.what());
+            fflush(stderr);
+            failures++;
+        }
+        catch (...) {
+            fprintf(stderr, "case threw (unknown, near line %d)
+", __LINE__);
+            fflush(stderr);
+            failures++;
+        }
 
         // ---- T4: typed payload error (code 0 + ErrorResp.error) ------------
-        {
+        try {
             settle();
             auto stats = std::make_shared<Stats>();
             ServerThread svc(
@@ -400,9 +444,21 @@ namespace {
             CHECK(r.message.contains("ERR_CONFIG_POLICY"));
             assertEnvelopeDiscipline(stats);
         }
+        catch (const std::exception &e) {
+            fprintf(stderr, "case threw (near line %d): %s
+", __LINE__, e.what());
+            fflush(stderr);
+            failures++;
+        }
+        catch (...) {
+            fprintf(stderr, "case threw (unknown, near line %d)
+", __LINE__);
+            fflush(stderr);
+            failures++;
+        }
 
         // ---- T5: version mismatch on Hello, then recovery ------------------
-        {
+        try {
             settle();
             auto stats = std::make_shared<Stats>();
             ServerThread svc(
@@ -435,9 +491,21 @@ namespace {
             CHECK(health.runtimeRunning);
             assertEnvelopeDiscipline(stats);
         }
+        catch (const std::exception &e) {
+            fprintf(stderr, "case threw (near line %d): %s
+", __LINE__, e.what());
+            fflush(stderr);
+            failures++;
+        }
+        catch (...) {
+            fprintf(stderr, "case threw (unknown, near line %d)
+", __LINE__);
+            fflush(stderr);
+            failures++;
+        }
 
         // ---- T6: response with an unexpected id -> protocol violation ------
-        {
+        try {
             settle();
             auto stats = std::make_shared<Stats>();
             ServerThread svc(
@@ -468,9 +536,21 @@ namespace {
             CHECK(r2.outcomeKnown());
             assertEnvelopeDiscipline(stats);
         }
+        catch (const std::exception &e) {
+            fprintf(stderr, "case threw (near line %d): %s
+", __LINE__, e.what());
+            fflush(stderr);
+            failures++;
+        }
+        catch (...) {
+            fprintf(stderr, "case threw (unknown, near line %d)
+", __LINE__);
+            fflush(stderr);
+            failures++;
+        }
 
         // ---- T7: connection break during Start -> UNKNOWN outcome ----------
-        {
+        try {
             settle();
             auto stats = std::make_shared<Stats>();
             ServerThread svc(
@@ -503,9 +583,21 @@ namespace {
             CHECK(svc.connections() >= 2);
             assertEnvelopeDiscipline(stats);
         }
+        catch (const std::exception &e) {
+            fprintf(stderr, "case threw (near line %d): %s
+", __LINE__, e.what());
+            fflush(stderr);
+            failures++;
+        }
+        catch (...) {
+            fprintf(stderr, "case threw (unknown, near line %d)
+", __LINE__);
+            fflush(stderr);
+            failures++;
+        }
 
         // ---- T9: no answer within the deadline; late response dropped ------
-        {
+        try {
             settle();
             auto stats = std::make_shared<Stats>();
             ServerThread svc(
@@ -542,9 +634,21 @@ namespace {
             CHECK(health.runtimeRunning);
             assertEnvelopeDiscipline(stats);
         }
+        catch (const std::exception &e) {
+            fprintf(stderr, "case threw (near line %d): %s
+", __LINE__, e.what());
+            fflush(stderr);
+            failures++;
+        }
+        catch (...) {
+            fprintf(stderr, "case threw (unknown, near line %d)
+", __LINE__);
+            fflush(stderr);
+            failures++;
+        }
 
         // ---- T12: oversized frame declaration -> violation, no crash -------
-        {
+        try {
             settle();
             auto stats = std::make_shared<Stats>();
             ServerThread svc(
@@ -573,7 +677,7 @@ namespace {
 
 #ifdef Q_OS_WIN
         // ---- T10: pipe access denial (SYSTEM-only DACL) ---------------------
-        {
+        try {
             settle();
             PSECURITY_DESCRIPTOR sd = nullptr;
             ULONG sdSize = 0;
@@ -602,7 +706,7 @@ namespace {
 #endif
 
         // ---- T8: the service pipe does not exist ----------------------------
-        {
+        try {
             settle();
             const auto r = client.Hello(nullptr, 5000);
             CHECK(r.outcome == API::ServiceClient::Outcome::ConnectFailed);
@@ -611,6 +715,18 @@ namespace {
             const auto r2 = client.Stop(5000);
             CHECK(r2.outcome == API::ServiceClient::Outcome::ConnectFailed);
             CHECK(r2.outcomeKnown());
+        }
+        catch (const std::exception &e) {
+            fprintf(stderr, "case T8 threw: %s
+", e.what());
+            fflush(stderr);
+            failures++;
+        }
+        catch (...) {
+            fprintf(stderr, "case T8 threw (unknown)
+");
+            fflush(stderr);
+            failures++;
         }
     }
 
@@ -621,7 +737,19 @@ int main(int argc, char *argv[]) {
 
     std::atomic<bool> done{false};
     std::thread body([&done] {
-        run_all();
+        try {
+            run_all();
+        } catch (const std::exception &e) {
+            fprintf(stderr, "run_all threw: %s
+", e.what());
+            fflush(stderr);
+            failures++;
+        } catch (...) {
+            fprintf(stderr, "run_all threw (unknown)
+");
+            fflush(stderr);
+            failures++;
+        }
         done.store(true);
     });
 
