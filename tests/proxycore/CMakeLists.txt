@@ -124,6 +124,9 @@ add_executable(proxycore_service_client
 set_property(TARGET proxycore_service_client PROPERTY AUTOMOC ON)
 target_include_directories(proxycore_service_client PRIVATE
         ${CMAKE_SOURCE_DIR}
+        # Generated bindings: spb generation writes core/server/gen/libcore.pb.h
+        # into the root binary directory (myproto.cmake is include()d there).
+        ${CMAKE_BINARY_DIR}
 )
 target_link_libraries(proxycore_service_client PRIVATE
         Qt6::Network
