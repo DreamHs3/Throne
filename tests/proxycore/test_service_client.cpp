@@ -208,8 +208,7 @@ namespace {
                 try {
                     handler(*c, env);
                 } catch (...) {
-                    fprintf(stderr, "handler threw (server thread)
-");
+                    fprintf(stderr, "handler threw (server thread)\\n");
                     fflush(stderr);
                     failures++;
                 }
@@ -340,14 +339,12 @@ namespace {
             assertEnvelopeDiscipline(stats);
         }
         catch (const std::exception &e) {
-            fprintf(stderr, "case threw (near line %d): %s
-", __LINE__, e.what());
+            fprintf(stderr, "case threw (near line %d): %s\\n", __LINE__, e.what());
             fflush(stderr);
             failures++;
         }
         catch (...) {
-            fprintf(stderr, "case threw (unknown, near line %d)
-", __LINE__);
+            fprintf(stderr, "case threw (unknown, near line %d)\\n", __LINE__);
             fflush(stderr);
             failures++;
         }
@@ -374,14 +371,12 @@ namespace {
             assertEnvelopeDiscipline(stats);
         }
         catch (const std::exception &e) {
-            fprintf(stderr, "case threw (near line %d): %s
-", __LINE__, e.what());
+            fprintf(stderr, "case threw (near line %d): %s\\n", __LINE__, e.what());
             fflush(stderr);
             failures++;
         }
         catch (...) {
-            fprintf(stderr, "case threw (unknown, near line %d)
-", __LINE__);
+            fprintf(stderr, "case threw (unknown, near line %d)\\n", __LINE__);
             fflush(stderr);
             failures++;
         }
@@ -408,14 +403,12 @@ namespace {
             assertEnvelopeDiscipline(stats);
         }
         catch (const std::exception &e) {
-            fprintf(stderr, "case threw (near line %d): %s
-", __LINE__, e.what());
+            fprintf(stderr, "case threw (near line %d): %s\\n", __LINE__, e.what());
             fflush(stderr);
             failures++;
         }
         catch (...) {
-            fprintf(stderr, "case threw (unknown, near line %d)
-", __LINE__);
+            fprintf(stderr, "case threw (unknown, near line %d)\\n", __LINE__);
             fflush(stderr);
             failures++;
         }
@@ -445,14 +438,12 @@ namespace {
             assertEnvelopeDiscipline(stats);
         }
         catch (const std::exception &e) {
-            fprintf(stderr, "case threw (near line %d): %s
-", __LINE__, e.what());
+            fprintf(stderr, "case threw (near line %d): %s\\n", __LINE__, e.what());
             fflush(stderr);
             failures++;
         }
         catch (...) {
-            fprintf(stderr, "case threw (unknown, near line %d)
-", __LINE__);
+            fprintf(stderr, "case threw (unknown, near line %d)\\n", __LINE__);
             fflush(stderr);
             failures++;
         }
@@ -492,14 +483,12 @@ namespace {
             assertEnvelopeDiscipline(stats);
         }
         catch (const std::exception &e) {
-            fprintf(stderr, "case threw (near line %d): %s
-", __LINE__, e.what());
+            fprintf(stderr, "case threw (near line %d): %s\\n", __LINE__, e.what());
             fflush(stderr);
             failures++;
         }
         catch (...) {
-            fprintf(stderr, "case threw (unknown, near line %d)
-", __LINE__);
+            fprintf(stderr, "case threw (unknown, near line %d)\\n", __LINE__);
             fflush(stderr);
             failures++;
         }
@@ -537,14 +526,12 @@ namespace {
             assertEnvelopeDiscipline(stats);
         }
         catch (const std::exception &e) {
-            fprintf(stderr, "case threw (near line %d): %s
-", __LINE__, e.what());
+            fprintf(stderr, "case threw (near line %d): %s\\n", __LINE__, e.what());
             fflush(stderr);
             failures++;
         }
         catch (...) {
-            fprintf(stderr, "case threw (unknown, near line %d)
-", __LINE__);
+            fprintf(stderr, "case threw (unknown, near line %d)\\n", __LINE__);
             fflush(stderr);
             failures++;
         }
@@ -584,14 +571,12 @@ namespace {
             assertEnvelopeDiscipline(stats);
         }
         catch (const std::exception &e) {
-            fprintf(stderr, "case threw (near line %d): %s
-", __LINE__, e.what());
+            fprintf(stderr, "case threw (near line %d): %s\\n", __LINE__, e.what());
             fflush(stderr);
             failures++;
         }
         catch (...) {
-            fprintf(stderr, "case threw (unknown, near line %d)
-", __LINE__);
+            fprintf(stderr, "case threw (unknown, near line %d)\\n", __LINE__);
             fflush(stderr);
             failures++;
         }
@@ -635,14 +620,12 @@ namespace {
             assertEnvelopeDiscipline(stats);
         }
         catch (const std::exception &e) {
-            fprintf(stderr, "case threw (near line %d): %s
-", __LINE__, e.what());
+            fprintf(stderr, "case threw (near line %d): %s\\n", __LINE__, e.what());
             fflush(stderr);
             failures++;
         }
         catch (...) {
-            fprintf(stderr, "case threw (unknown, near line %d)
-", __LINE__);
+            fprintf(stderr, "case threw (unknown, near line %d)\\n", __LINE__);
             fflush(stderr);
             failures++;
         }
@@ -717,14 +700,12 @@ namespace {
             CHECK(r2.outcomeKnown());
         }
         catch (const std::exception &e) {
-            fprintf(stderr, "case T8 threw: %s
-", e.what());
+            fprintf(stderr, "case T8 threw: %s\\n", e.what());
             fflush(stderr);
             failures++;
         }
         catch (...) {
-            fprintf(stderr, "case T8 threw (unknown)
-");
+            fprintf(stderr, "case T8 threw (unknown)\\n");
             fflush(stderr);
             failures++;
         }
@@ -740,13 +721,11 @@ int main(int argc, char *argv[]) {
         try {
             run_all();
         } catch (const std::exception &e) {
-            fprintf(stderr, "run_all threw: %s
-", e.what());
+            fprintf(stderr, "run_all threw: %s\\n", e.what());
             fflush(stderr);
             failures++;
         } catch (...) {
-            fprintf(stderr, "run_all threw (unknown)
-");
+            fprintf(stderr, "run_all threw (unknown)\\n");
             fflush(stderr);
             failures++;
         }
